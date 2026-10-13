@@ -4111,6 +4111,12 @@ func (s *Scanner) scanLibrary(ctx context.Context) {
 		if !pathUnderDir(path, effDir) {
 			slog.Debug("library scan: title+author match rejected (outside library root)",
 				"title", b.Title, "path", path, "root", effDir)
+			// A book another file already claimed still makes this file its
+			// sidecar when the root check turns the file away (#2188), as it
+			// did when the claim check ran first.
+			if reconciledBooks[bookFormatClaim{b.ID, detectedFmt}] {
+				claimBlocked = true
+			}
 			return titleReconcileHit{}, false
 		}
 		existingPath := b.EbookFilePath
@@ -4211,12 +4217,23 @@ func (s *Scanner) scanLibrary(ctx context.Context) {
 		}
 		if len(hits) > 0 {
 			best := hits[0]
-			for _, hit := range hits {
-				if hit.blocked && best.score-hit.score < titleReconcileMargin {
-					if hit.claimed {
-						claimBlocked = true
+			// An exact normalised title that is wanted, still claimable and
+			// strictly ahead of every other hit owns the file, whatever
+			// blocked books lie within the margin. A blocked near sibling (a
+			// Skipped book, or one already holding a file) must not push a
+			// file named exactly as the wanted book back to Unmatched, which
+			// would leave that book Wanted and downloaded again. This is the
+			// exact-strictly-ahead rule FindExisting uses (fileBelongsToRival).
+			// A tie at 1.0, or a blocked best, still refuses below.
+			exactLead := best.score == 1 && !best.blocked && (len(hits) == 1 || best.score > hits[1].score)
+			if !exactLead {
+				for _, hit := range hits {
+					if hit.blocked && best.score-hit.score < titleReconcileMargin {
+						if hit.claimed {
+							claimBlocked = true
+						}
+						return false
 					}
-					return false
 				}
 			}
 			if len(hits) > 1 {
