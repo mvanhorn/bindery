@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -141,8 +142,20 @@ type modeRequest struct {
 // setup is required. Always public — this is what the frontend hits on load.
 func (h *AuthHandler) Status(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	// A signed session cookie the middleware could not check is not a
+	// signed out caller. The UI reads authenticated=false from this route as
+	// a logout and goes to the login page, so answer with an error it can
+	// retry instead. A request the client abandoned gets no body at all.
+	if auth.SessionLookupFailed(ctx) {
+		writeSessionCheckUnavailable(w, r, nil)
+		return
+	}
 	count, err := h.users.Count(ctx)
 	if err != nil {
+		if ctx.Err() != nil {
+			w.WriteHeader(auth.StatusClientClosedRequest)
+			return
+		}
 		writeServerError(w, r, err)
 		return
 	}
@@ -155,7 +168,13 @@ func (h *AuthHandler) Status(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if uid := auth.UserIDFromContext(ctx); uid != 0 {
-		if u, _ := h.users.GetByID(ctx, uid); u != nil {
+		u, err := h.users.GetByID(ctx, uid)
+		if err != nil {
+			// Same reasoning: a failed read is not a deleted user.
+			writeSessionCheckUnavailable(w, r, err)
+			return
+		}
+		if u != nil {
 			resp.Authenticated = true
 			resp.Username = u.Username
 			resp.Role = u.Role
@@ -176,6 +195,21 @@ func (h *AuthHandler) Status(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeOK(w, resp)
+}
+
+// writeSessionCheckUnavailable answers a status request whose session could
+// not be checked: 503 so the UI keeps its signed in state and retries, or
+// nothing useful when the client already abandoned the request.
+// err, when set, is logged; the middleware already logged its own failure.
+func writeSessionCheckUnavailable(w http.ResponseWriter, r *http.Request, err error) {
+	if r.Context().Err() != nil {
+		w.WriteHeader(auth.StatusClientClosedRequest)
+		return
+	}
+	if err != nil {
+		slog.Error("session check failed", "path", r.URL.Path, "error", err)
+	}
+	writeErr(w, http.StatusServiceUnavailable, "session check unavailable, try again")
 }
 
 // Setup creates the first admin user. Only allowed while no user exists.
@@ -359,10 +393,31 @@ func (h *AuthHandler) ChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnauthorized, "user not found")
 		return
 	}
-	if !auth.VerifyPassword(req.CurrentPassword, u.PasswordHash) {
+	// The current-password check is a password oracle for anyone holding a
+	// session (a stolen cookie, an unattended browser), so it is throttled like
+	// Login: the same limiter, keyed on the account rather than the IP because
+	// the session already identifies it. Acquire counts the attempt before the
+	// KDF runs, so a burst cannot run more than the limit; Reset clears it on
+	// success.
+	limiterKey := "password-change:" + strconv.FormatInt(u.ID, 10)
+	if !h.limiter.Acquire(limiterKey) {
+		slog.Warn("password change: too many wrong current passwords, refusing", "user_id", u.ID)
+		writeErr(w, http.StatusTooManyRequests, "too many attempts, try again later")
+		return
+	}
+	ok, err := h.verifyPassword(ctx, req.CurrentPassword, u.PasswordHash)
+	if err != nil {
+		// The client went away while waiting for a KDF slot; nothing was
+		// verified, so do not count it.
+		h.limiter.Release(limiterKey)
+		writeErr(w, http.StatusServiceUnavailable, "server busy, try again")
+		return
+	}
+	if !ok {
 		writeErr(w, http.StatusUnauthorized, "current password incorrect")
 		return
 	}
+	h.limiter.Reset(limiterKey)
 	hash, err := auth.HashPassword(req.NewPassword)
 	if err != nil {
 		writeServerError(w, r, err)

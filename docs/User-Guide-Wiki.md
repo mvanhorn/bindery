@@ -87,6 +87,24 @@ nothing populated the catalogue first. That list is where you can adopt them.
 The sequence that works is always: **populate the catalogue, then scan**. See
 [Bringing in an existing library](#bringing-in-an-existing-library) below.
 
+The scan leaves out folders that are not library content: known junk and sync
+folders (`.torrents`, `.Trash-*`, `.Trashes`, `.incomplete`,
+`.bindery-stage-*`, `.AppleDouble`, `.AppleDB`, `.Spotlight-V100`,
+`.fseventsd`, `.TemporaryItems`, `.DocumentRevisions-V100`, `.thumbnails`,
+`.stfolder`, `.stversions`, `.syncthing.*`, `.sync`, `.git`, `.svn`,
+`.recycle`, `.snapshot`, and the NAS and file system folders `@eaDir`,
+`#recycle`, `.@__thumb`, `.zfs`, `.snapshots` and `lost+found`, in any
+letter case), any folder holding a
+`.binderyignore` file (an empty file is enough; everything under that folder
+is skipped), and the download folders (`BINDERY_DOWNLOAD_DIR`,
+`BINDERY_AUDIOBOOK_DOWNLOAD_DIR`) when they sit inside a library folder. Other
+folders that start with a dot are scanned, because a book folder can start
+with one (`...And Then There Were None`, `.hack Sign`); to leave one out, put
+a `.binderyignore` file in it. The same goes for the check that skips
+searching for books you already have, and for importing a folder from
+**Import**. Entries an earlier scan listed from those folders disappear on the
+next scan.
+
 ### 2. Status and Monitored are two different switches
 
 Every book has a **status** — its acquisition lifecycle:
@@ -123,7 +141,14 @@ default; tick it to bring every book of those authors into line in one action.
 
 Two related labels:
 
-- **In Library** = status `imported` = Bindery can see the file on disk.
+- **In Library** = Bindery can see at least one file for the book on disk. That is
+  status `imported`, and also a `wanted` book of format *Both* that already has
+  one of its two formats: it stays on the Wanted page while the other format is
+  missing, and it is listed under In Library as well (#3132). The Books page,
+  an author page's In library count and the have / total number on the Authors
+  list all use this one rule. With a format filter set, the book has to own
+  that format, so Audiobook plus In Library does not list a book that only has
+  an ebook.
 - **Exclude vs Delete**: a metadata refresh only adds books back for an author
   you monitor and have set to take new items, so for those authors deleting an
   unwanted catalogue book is temporary — the next refresh recreates it.
@@ -205,10 +230,15 @@ monitored.
 | **Library imports** (Calibre, Readarr, ABS, Goodreads CSV, author list) | Your existing catalogue — see the next section |
 
 **Add Author** and **Add Book** open the same dialog. Type an author name, a
-title, an ISBN or an ASIN and press Enter; the results list authors first, each
-followed by the books the provider attributes to them, with any remaining books
-under a *Books* divider. Which button you pressed only changes the placeholder.
-What you pick decides what happens next: an author row leads to the monitoring
+title, an ISBN or an ASIN and press Enter. The **All / Books / Authors** control
+under the search box picks what the results show: *Books* is a flat list of
+books, best title match first; *Authors* is author rows only; *All* lists
+authors first, each followed by the books the provider attributes to them, with
+any remaining books under a *Books* divider. **Add Book** opens on *Books*,
+**Add Author** on *Authors*, and the header search on *All*. Every search looks
+up both kinds, so switching views is instant, and each view shows how many
+results it holds. Which button you pressed otherwise only changes the
+placeholder. What you pick decides what happens next: an author row leads to the monitoring
 step (metadata profile, root folder, media type, monitor mode, auto-grab), a
 book row to the single-book step (cover, identifiers, format, search on add).
 Rows that already match something in your library say **In your library** with
@@ -408,6 +438,55 @@ a CWA ingest folder, Grimmory's BookDrop, an Audiobookshelf library scan,
 webhooks. The three ways of reaching Calibre or CWA are easy to mix up; the
 [Calibre integration guide](Calibre-Integration-Wiki.md) tells them apart.
 
+**The file's language is checked at import.** The language filter at grab
+time can only read the release name, so a release that does not say its
+language gets through it. When the download arrives, Bindery reads the
+language the EPUB declares (its `dc:language`) and compares it with the
+languages the book may be in: the allowed languages on the author's metadata
+profile, or, when that profile allows any language, the preferred search
+language if it is set to English. That is the same rule the release name was
+held to, so a file is never judged more strictly than its name would have
+been.
+
+- **The file is in an allowed language**, declares no language, or declares
+  one that is not a specific language (`und`, `mul`): it imports as normal.
+  Every language an EPUB declares counts, so a bilingual edition tagged
+  French and English is allowed under an English profile. Region tags are
+  ignored, so `en-US` and `en_GB` count as English, Bokmål and Nynorsk (`nb`,
+  `nob`, `nn`, `nno`) count as Norwegian, and `cmn` and `yue` count as
+  Chinese. Every two letter ISO 639-1 code is recognised, including the
+  withdrawn `iw`, `in` and `ji`, which count as Hebrew, Indonesian and
+  Yiddish.
+- **The release holds EPUBs in both allowed and disallowed languages**: the
+  allowed ones are imported and the others are left out, the same way a
+  disallowed format inside a release is left out. An EPUB that declares no
+  language, or `und` or `mul`, is imported alongside them. Next to a
+  disallowed EPUB with nothing in an allowed language, though, it does not
+  save the release: it is most likely the same edition with its metadata
+  stripped, so the release is rejected as below.
+- **Every file is in a language the profile does not allow**: the release is
+  treated as the wrong release. Nothing is placed, the Queue row is blocked
+  with a message naming both languages ("file declares Swedish (swe), but the
+  metadata profile "Standard" allows only English (eng)"), the release is
+  added to the Blocklist so the next search picks a different one, and the
+  book stays Wanted. The failure is in History and is sent to your webhooks
+  like any other failed import.
+- **The profile allows any language** (and the preferred search language is
+  not English): nothing is rejected. When the file's language differs from
+  the book's, the book is relabelled to the file's language and History
+  records a "language corrected" row, because the file on disk is the edition
+  you actually have.
+
+To keep a rejected file anyway, use **Match to book** on the Queue row, or
+import it through **Import → From a folder**. A manual import is your own
+choice and is never refused for its language. If you locked a book's language
+by editing it, a file in that language is accepted for that book even when the
+profile does not allow it. Only downloads are checked: a library scan,
+adopting files already in your library, and books imported before this check
+existed are left alone. With the import mode set to **External**, Bindery
+hands the download to your other tool without opening its files, so nothing
+is checked there either. Audiobooks are not checked yet.
+
 If the library app downstream reads sidecar metadata, turn on **Write a
 metadata.opf sidecar** in Settings → General (off by default). Bindery then
 writes a Calibre style `metadata.opf` next to each imported ebook and
@@ -419,11 +498,14 @@ the recovery actions: **Retry import** (after fixing a path remap), **Retry
 download** on a row that failed before its files arrived (this re-sends the same
 release, it does not search for a different one), **Match to
 book** (attach a failed import to the right book and import it from disk), and
-per-row error detail. Tick rows for **Retry selected**, or use **Retry all
+per-row error detail. An `imported` row leaves the Queue after 7 days (it stays on History), failed and blocked rows stay until you deal with them, and Bindery deletes finished download rows older than `BINDERY_DOWNLOAD_RETENTION_DAYS` (90 by default, `0` keeps them). Once a row is trimmed, Bindery no longer remembers that exact release was grabbed, so if you later delete the file and the book is wanted again, the same release can be grabbed again. Tick rows for **Retry selected**, or use **Retry all
 failed** to cover every failed row at once. If a download client does not answer
 in time the page says so above the list, so a short Queue is never mistaken for
 lost downloads. History records every grab/import/failure and can
-blocklist a bad release in one click. Blocked releases are listed under
+blocklist a bad release in one click. A release NZBGet or SABnzbd fails as
+broken (missing articles, a failed repair or unpack, a corrupt archive) is
+blocklisted for you, with the client's verdict as the reason, so the next
+search picks a different one. Blocked releases are listed under
 Settings → Blocklist, where you can remove one to let it be grabbed again.
 
 Bindery does not chase format upgrades on its own: the sweep only searches
@@ -497,16 +579,39 @@ to the records. Things worth knowing before you judge the results:
   per book with a sentence saying why and what to do: add the author, confirm
   a suggested book, or choose one. See [Adopting files already in your
   library](#adopting-files-already-in-your-library).
-- **Fix match moves and renames the file.** When a book page shows the wrong
-  file, the **Fix match** button reassigns it to the book you pick. That runs
-  the full import, so the file is moved into the target book's folder and
+- **Fix match corrects the link and leaves the file alone by default.** When a
+  book page shows the wrong file, the **Fix match** button reassigns it to the
+  book you pick. After you pick the book, the modal asks what should happen to
+  the file. **Correct the match only**, the default, keeps the file where it
+  is under its current name and only changes which book it belongs to, the way
+  Readarr's fix match does (#2055). **Also move and rename the file** runs the
+  full import instead, so the file is moved into the target book's folder and
   renamed from your naming template, replacing your own layout for that file.
-  The modal warns you and shows the exact destination path before you confirm,
-  and nothing happens until you do; the move itself then runs in the background
-  and Bindery cannot undo it for you. Reassigning the metadata link *without*
-  relocating the file is not available yet (#2055).
+  Choosing it shows the exact destination path before you confirm; the move
+  then runs in the background and Bindery cannot undo it for you. Nothing
+  happens until you confirm either way. History records the change as **File
+  Moved**, naming the book the file came from.
+- **An import never takes a file another book already tracks.** If a download
+  or a manual import lands on a path that a different book already has, the
+  import stops with **Import Blocked** and the Queue row names that book and
+  its id. Nothing is recorded or overwritten, and the book you imported for
+  stays Wanted. If the file really belongs to the book you imported it for,
+  open the book it is attached to and use **Fix match** to move it (#2937).
+  When the book holding the path has since been deleted, a download, a manual
+  import, adopting the file on the Import page, or adding its author takes it
+  over automatically.
 - A folder holding both an ebook and an audiobook for the same book attaches
   both in a single scan — one file per format, so a second scan is not needed.
+- In a **flat** layout, where audiobooks sit straight in the author folder as
+  `Author/Title.mp3`, each file is matched on its own. A tracked audiobook only
+  claims the other files in that folder that are tracks of it (the same name
+  up to a part, track, chapter or disc number, written as digits or as a word
+  like `Part Two`, or a name that starts with its number such as `02.mp3` or
+  `02 - Chapter Two.mp3`; a chapter title after the number is ignored), so
+  another audiobook by the same author beside it is attached to its own book
+  or listed as unmatched (#1985). Titles that differ only by a number, such as
+  `Saga 1.mp3` and `Saga 2.mp3`, still read as tracks of one audiobook; give
+  each book its own folder to keep them apart.
 - A PDF, TXT, RTF, CBZ or CBR sitting in a folder that also holds audio is treated as
   an **audiobook supplement** (the companion PDF Audible-style releases ship)
   and is not attached as the book's ebook. The same file in a folder with no
@@ -565,6 +670,22 @@ How to work through the list:
   book that already has a file adds the new file alongside it (#2879).
   Suggestions are worked out by the scan, so a book added since the last scan
   appears after the next one; until then, search for it in the editor.
+- **Files that name another author than their folder** say so: the row reads,
+  for example, **Files say Katy Evans, folder says James Patterson**. The
+  author comes from the audio tags, or from track names that all read
+  `Author - Title 1`, `Author - Title 2` and so on. Artist, Album Artist and
+  Composer are all checked, so a narrator in Artist beside the author in Album
+  Artist is not a conflict, and neither are credits such as Various Artists,
+  Unknown Author(s), Anonymous, Full Cast, or an audiobook publisher such as
+  Brilliance Audio, Recorded Books or Tantor Audio, however they are
+  punctuated. Such files are also never attached by the scan to the
+  book their folder is named after. The row is named after the
+  book the files name (the album tag, or the title in those track names), and
+  suggestions come from the files' author first, scored on that title. Books
+  by the folder's author are still listed below them, marked **Folder author
+  only**, but they are never preselected and never a one click Confirm. When
+  the files' author is not in your library, the row offers **Add author** for
+  them, not for the folder's author (#2942).
 - **Choose book** opens the row in place: the suggestions with their scores,
   a search of your library (prefilled from the file), and a collapsed
   **Search metadata**. Metadata providers are only asked when you press Search
@@ -609,6 +730,22 @@ Things worth knowing:
 
 - Only regular files inside your library folders are listed. A symlink is not
   adopted, including one inside the library that points elsewhere.
+- **Too small to be a book**: an ebook format file under 4 KiB (a notes,
+  readme or link file, about two pages of plain text at most) is never
+  attached to a book automatically: the library scan does not match it to a
+  book, and adding an author does not treat it as a book you already own. It
+  is listed here on a row of its own with that label and no suggestion, and
+  cannot be adopted. Ignore it, or delete it from the folder. A notes file
+  beside the book file that matched is still counted quietly as that book's
+  companion and not listed. Audiobook tracks are not judged by size, and
+  files already tracked are not affected (#2944). If a file that small really
+  is the book, **Manual Import** is the override: it imports whatever file
+  you pick, whatever its size.
+- **In your audiobooks folder** / **In your ebooks folder**: when
+  `BINDERY_AUDIOBOOK_DIR` is its own folder, a row found in the other
+  format's folder (say an `.epub` under the audiobooks root) says so, and its
+  suggestion is never a one click Confirm. You can still adopt it after
+  checking. With one combined folder for both there is nothing to label.
 - A scan that finds no files at all (an unmounted volume, say) changes
   nothing on this list, so your ignores and adoptions survive it.
 - An adopted row stays, with Undo, for as long as its book exists. An ignored
@@ -677,7 +814,28 @@ like everything else on that tab that names server paths.
   author's catalogue looks like. It is community data: expect occasional
   duplicates, language mix-ups, and box-set entries. The "primary" selector
   (Settings → Metadata Profiles → Library Defaults) offers OpenLibrary,
-  **DNB** (German National Library), and **Hardcover**.
+  **DNB** (German National Library), **Nasjonalbiblioteket** (National Library
+  of Norway: Norwegian books under their original titles, only used when chosen
+  as primary), **BnF** (Bibliothèque nationale de France: French editions under
+  their French titles, translations included, only used when chosen as primary),
+  and **Hardcover**. Switching the primary away from Nasjonalbiblioteket or BnF
+  switches it off entirely, so authors linked to it stop syncing until you
+  relink each one with "Link metadata" on their page.
+- **BnF** suits a library of French editions whose indexers name releases
+  after the French title ("Alice au pays des merveilles", not "Alice's
+  Adventures in Wonderland"). Its data is under the Licence Ouverte / Open
+  Licence 2.0, credited in Settings where you choose it, and each BnF book and
+  author page shows the credit with the date its record was retrieved;
+  Bindery fetches no covers from BnF, so covers come from the other
+  providers. BnF is moving its catalogue to a new record model until the end
+  of 2026, and records created since June 2026 are not yet linked to their
+  author, so Bindery finds those by the author's name, only when no other
+  person in BnF's authority file has the same name, and treats an author's
+  BnF catalogue as possibly
+  incomplete: catalogue reconciliation never offers to remove a book because
+  BnF did not list it. BnF publishes no rate limit, so Bindery sends it at most
+  one request a second; refreshing an author with a long catalogue can take
+  around fifteen seconds.
 - **Hardcover** is an enricher by default — it improves search results,
   ratings, and series data, and powers import lists and the Discover wishlist
   row. **Without an API token (Settings → API Keys) Hardcover is silently
@@ -695,16 +853,36 @@ like everything else on that tab that names server paths.
   selector stays disabled until you save one.
 
   When a metadata profile restricts languages, Bindery checks Hardcover's
-  editions for each author work in one batched request. A translated default
-  edition is not treated as the language of the whole work: any edition in an
-  allowed language keeps the work, while a work is rejected as non-allowed
-  only when the lookup completes and finds no allowed edition. This filtering
-  evidence does not rewrite the displayed language, which remains the
+  editions for each author work in one batched request. This happens whether
+  Hardcover is the primary provider or supplements OpenLibrary, so the
+  Hardcover works merged into an OpenLibrary author are checked too. A
+  translated default edition is not treated as the language of the whole work:
+  any edition in an allowed language keeps the work, while a work is rejected
+  as non-allowed only when the lookup completes and finds no allowed edition
+  and some edition, default or not, records another language. A work with no
+  language on any edition stays unknown. This filtering evidence does not
+  rewrite the displayed language, which remains the
   provider's preferred/default language or the user's locked value. If the
   evidence is indeterminate or its lookup fails, normal refreshes fall through
   to the existing edition-sampled, author-majority, and scalar language before
-  applying **When book language is unknown**. **Reconcile catalogue** treats a
+  applying **When book language is unknown**. The author-majority fallback is
+  not applied to a work whose title is written in a different script from the
+  author's other titles (a Cyrillic title in an English author's catalogue, for
+  example), so such a work stays unknown. OpenLibrary edition sampling only
+  runs for OpenLibrary works, and takes the language and a missing cover from
+  the edition OpenLibrary features on the work's own page first, falling back
+  to a small sample of its editions (and a cover in the sampled language) only
+  for what that edition lacks. **Reconcile catalogue** treats a
   failed lookup as indeterminate rather than offering the row for removal.
+- **Covers from your own files.** When no metadata provider has a cover for
+  a book, Bindery uses the art embedded in the file you import (M4B, MP3,
+  FLAC, EPUB), or a `cover.jpg` / `folder.jpg` in a multi-file audiobook's
+  folder. Books already in your library pick theirs up on the next library
+  scan. A provider's cover is never replaced, so this only fills blanks.
+- **Your own cover.** **Upload cover** (or **Change cover**) under a book's
+  cover sets it from a JPEG, PNG, WebP or GIF image of up to 10 MB. It
+  replaces whatever cover the book had, and a refresh keeps it, since
+  refresh only fills an empty cover.
 - **Google Books** (free API key) and **Audnexus/Audible** (audiobook
   narrator, duration, by ASIN) enrich further.
 
@@ -722,14 +900,36 @@ This refresh also runs when the edition fetch is empty, unchanged, or fails.
 If a book is rebound while editions are being fetched, later edition writes for
 the old book identity are skipped.
 
+Audnex enrichment follows the same rule. When an Audiobookshelf import or a
+Hardcover list sync enriches a book you edited while the Audnex lookup was in
+flight, your edit is kept and that enrichment is skipped. The **Enrich** button
+on the book page retries once on top of your edit; if the book keeps changing
+it asks you to try again. **Rebind** does the same when the book changes while
+the new record is being fetched.
+
+The same goes for the other writes that follow a provider lookup. When an
+Audiobookshelf import merges a book or an author with its upstream record and
+you edit it during the lookup, the merge is applied on top of your edit; if
+the row keeps changing, the merge waits for the next import. That protects the
+fields the merge does not take from upstream, such as monitoring, the narrator,
+the format and the quality, metadata and root folder profiles. The fields it
+does take from upstream follow the usual metadata conflict rules even when you
+just changed them: for a book the description, cover, original title, release
+date, language and ratings, and for an author the name, description, image,
+disambiguation and sort name. A **Refresh Metadata** on
+an author re-reads each book it matched by title just before updating it, so
+edits made while the refresh runs are kept. The scheduled author metadata
+refresh skips an author you edited while its profile was being fetched and
+picks it up on the next run.
+
 Which of those a given book actually came from is on the book page, under
 **Metadata source**. It names the provider, shows the identifier the book is
 bound to with a copy button, and lists any other provider ids the same book is
 known by. That is the thing to check before deciding a book needs re-binding,
 and the id is what to quote in a bug report. Hover or activate **Links** while
 confirming a book in the Add to library dialog or in the book header to open
-trustworthy upstream pages for OpenLibrary, Google Books, Hardcover, and DNB
-records.
+trustworthy upstream pages for OpenLibrary, Google Books, Hardcover, DNB,
+Nasjonalbiblioteket and BnF records.
 Calibre and Audiobookshelf ids remain visible only under **Metadata source**
 because they do not map to stable public pages.
 
@@ -740,10 +940,12 @@ When metadata is wrong, you have three levels of fix:
 2. **Re-bind** the book, or **relink** the author ("Find better match"), to a
    different provider record when the match itself is wrong.
 3. A **metadata profile** (languages, minimum page count, minimum edition
-   count, skip part books) filters what a catalogue sync lets in. Filling a
-   series skips every metadata profile filter today, the edition count included
-   ([#2208](https://github.com/vavallee/bindery/issues/2208)), so a filled
-   series can still bring in thin works.
+   count, skip part books) filters what a catalogue sync lets in, and what
+   **Fill gaps** or **add all** on a series creates
+   ([#2208](https://github.com/vavallee/bindery/issues/2208)). Adding a single
+   row from a series is an explicit pick and is not filtered. Filters screen
+   books as they arrive; **Reconcile catalogue** on an author applies them to
+   books already stored.
 
 Box sets need no setting. A work whose title plainly names a bundle ("... Box
 Set", "3 Books Set", "Carton of 10 Signed Copies") is dropped from every
@@ -767,9 +969,12 @@ add works, the author page says how many and why.
 current data: the bio, the photo, the book list and, when the default media
 type is audiobook or both, the Audible catalogue. The page waits for the
 refresh to finish and then shows the result, so a bio, photo or new book added
-upstream shows up on the first click. The page waits up to a minute; a refresh
-that takes longer carries on in the background, and reloading the page later
-shows it. Clicking Refresh again while a refresh for that author is still
+upstream shows up on the first click. The Refresh button is freed after a
+minute; a refresh that takes longer carries on in the background, and the page
+keeps watching it and shows the result when it ends. The same goes for the
+sync that adding an author starts: until it ends, the author page says the
+catalogue is being fetched rather than that the author has no books, which for
+a large catalogue can take a few minutes. Clicking Refresh again while a refresh for that author is still
 running waits for that one instead of starting another. If the refresh
 already running was a scheduled, bulk or Refresh all one, which read the
 cached copy, the page waits for it to finish and then runs its own refresh.
@@ -827,9 +1032,11 @@ and each new book is monitored or not according to the author's monitor mode.
 - **Opting an author out:** set their **Monitor new items** to *Don't add
   them*. Unmonitored authors and Calibre library authors are not checked
   either.
-- **When a provider struggles:** when OpenLibrary or Hardcover refuses with a
-  rate limit, the pass stops and the remaining authors wait for the next
-  hour. When three authors in a row fail because the provider is down (server
+- **When a provider struggles:** every metadata provider waits and retries
+  when it is told to slow down, honouring the provider's own `Retry-After`,
+  and holds its other requests for that long too. When a provider still
+  refuses with a rate limit after that, the pass stops and the remaining
+  authors wait for the next hour. When three authors in a row fail because the provider is down (server
   errors, network failures, timeouts), the pass stops too, and those three
   are tried again in about six hours rather than a week later. An error about
   one author, such as an author the provider no longer knows, counts that
@@ -882,11 +1089,14 @@ indeterminate row separately with its provider and the incomplete-evidence
 reason so it can be reviewed manually; these informational rows have no
 selection control and cannot be sent for removal.
 
+### Reviewing duplicate titles
+
 **Duplicate titles.** The same book often reaches the catalogue twice under
 slightly different titles — "The Martian" and "Martian", "Dune" and "Dune
 (Unabridged)". Open the author and choose **More → Review duplicates…** to see
 groups of titles that look like the same book. Each group shows which rule
-matched (identical after normalisation, a leading article dropped, an edition
+matched (identical after normalisation, a leading article dropped or filed behind
+a comma as in "Trace of Death, A", an edition
 marker dropped, or one title being the main title or subtitle of the other),
 and each row shows the rules that pulled it in. A main title or subtitle match
 only counts at a colon, bracket or spaced dash, so Asimov's "Foundation" is not
@@ -898,6 +1108,54 @@ without deleting anything. An excluded row stays in its group, struck through,
 with an **Include** button to undo it; a group leaves the report once fewer
 than two of its rows are still included.
 
+**The evidence on each row.** Under every title the review shows what Bindery
+already knows about that row, so you can decide without opening each book:
+whether it has files (ebook, audiobook, and the format, such as epub or m4b),
+its status (Wanted, In Library, Skipped), release year, language, ISBN, ASIN,
+and series with position. The rows are numbered, and above them the group
+lists what the rows agree or disagree on:
+
+| Marker | What it means |
+|--------|---------------|
+| Rows share an ISBN or ASIN | strong evidence they are one book |
+| Rows hold the same series position | strong evidence they are one book |
+| Rows hold different positions in one series | probably different books of that series |
+| Release years more than a year apart | possibly a different book, or an old and a new edition |
+| Different languages | possibly a translation rather than a duplicate |
+
+Languages are compared by meaning, so "en", "eng" and "English" agree, and
+series positions by number, so "1" and "1.0" agree. An unknown year, language
+(including "und" and "mul") or position never counts as a disagreement.
+
+**Which row to keep.** When exactly one row in a group has files, it is marked
+**Keep: has files**. If the rows also have no disagreement, and something
+positively ties each empty row to that one (a shared ISBN or ASIN, the same
+series position, or a title that is the same apart from punctuation, a leading
+article or an edition marker), the group offers **Exclude the empty rows in
+this group**, which shows you the rows it will exclude and asks you to confirm
+before it does anything. A title that only contains the other one, such as
+"Mistborn" and "Mistborn: The Hero of Ages", is not enough on its own. It is
+never offered when the rows disagree, or when more than one row has files,
+because then the files alone do not tell you which row is the real book. A row
+with files is never part of that suggestion, and if one of the empty rows is
+imported after you opened the page, Bindery skips it and tells you. You can
+still exclude a row with files with its own **Exclude** button, and Bindery
+asks first. Excluding never deletes a file.
+
+**Across the whole library.** On the **Books** page, **Review duplicates**
+opens a page listing the duplicate groups for every author, a page at a time,
+with the same evidence and the same buttons. It finds exactly the groups each
+author's own window would: titles are only compared with other titles by the
+same author. After you exclude rows, a group that no longer has two included
+rows drops off the list. On a shared install with per user libraries, each
+person sees only the authors they could open themselves.
+
+A title filed with its article last ("Trace of Death, A") counts as the same
+title as "A Trace of Death", both here and when a refresh decides whether a
+book is already in your library, so a refresh no longer adds a second row for
+it. Pairs that already exist are never merged for you. They stay as two rows
+and appear here as a group, and you choose which to exclude.
+
 ## How author names are filed
 
 One value decides the order of the Authors list, the order of the OPDS author
@@ -906,9 +1164,19 @@ name**, which is the display name rewritten as "Last, First". Bindery derives
 it when the author is created, and a metadata refresh replaces it with the
 provider's own sort name whenever the provider supplies one.
 
-So the Authors page is sorted by last name out of the box. **A to Z** in the
-Sort menu gives you Asimov, Atwood, Bardugo; the two **First name** entries are
-the ones that file Isaac under I.
+So the Authors page is sorted by last name out of the box. **Last name A to Z**
+in the Sort menu gives you Asimov, Atwood, Bardugo; the two **First name**
+entries are the ones that file Isaac under I (#2805). The merge authors dialog
+lists authors in the same last name order, and the Books grid's sort menu offers
+**Author A to Z** and **Z to A**, which only the table's column header reached
+before.
+
+The Books column of the Authors table reads *have / total*, for example 5 / 12,
+and each card in the grid says how many of the author's books are in your library,
+by the In Library rule under rule 2 near the top of this page (#3092). An author with no books shows a dash.
+On an author's own page the book list has a **Sort** control (title, published,
+added, each both ways) and Monitored and Language filters beside Type, Status and
+Published (#3087); books with no release date sort last.
 
 | Display name | Files under | Rule |
 |---|---|---|
@@ -979,7 +1247,10 @@ defined rather than translated per language.
 
 Knowing the edges saves time:
 
-- **Track reading.** No read/unread, progress, or ratings. Bindery acquires
+- **Track reading.** No read/unread, progress, or ratings of your own. Bindery
+  shows the community rating the metadata provider supplies (on the book page,
+  in the Books and author tables and grids, and in Add to library; the Books
+  table sorts by it, unrated books last), but does not record yours. Bindery acquires
   and organises; Audiobookshelf, Hardcover, or your reader do consumption.
 - **Identify arbitrary releases.** No release-first flow (see the top of this
   page).
@@ -996,10 +1267,18 @@ Knowing the edges saves time:
   linked to another disk (`/books/Author -> /mnt/disk2/Author`), is written
   through on import and followed when serving a book, including when it
   points outside your library folders, because only you can create one.
-  Library Scan is the exception: it does not descend into any linked folder,
-  including a library folder that is itself a symlink, so books under a linked
-  author folder (or a linked library root) are not found by a scan. A bind
-  mount is not a link and scans normally. A linked *file* is
+  Deleting a book or author with its files is the exception: it only removes
+  files that resolve to a place inside your library folders, so files behind
+  a linked folder that points elsewhere stay on disk (the log says
+  `path containment: refusing to delete file`) and the book is still removed
+  from Bindery. If you link author folders to another disk, add the link
+  target as an extra root folder (Settings, Root Folders), or deleting a book
+  there leaves its files behind.
+  Library Scan follows a library or audiobook folder that is itself a symlink
+  and records the books under the path you configured, but it does not
+  descend into a linked folder *inside* it, so books under a linked author
+  folder are not found by a scan. A bind mount is not a link and scans
+  normally. A linked *file* is
   not a book file: imports place regular files only (a symlink inside a
   download never lands in your library, and a download folder that is itself
   a symlink is refused in every import mode, including the drop folder

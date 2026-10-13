@@ -1,4 +1,4 @@
-import { forwardRef, type KeyboardEvent } from 'react'
+import { forwardRef, useId, useState, type KeyboardEvent } from 'react'
 import { Link } from 'react-router'
 import { useTranslation } from 'react-i18next'
 import type { AdoptionItem } from '../../api/client'
@@ -8,7 +8,7 @@ import MoreMenu, { type MoreMenuItem } from '../../components/MoreMenu'
 import { formatBytes } from '../../util/format'
 import { adoptionHint, unitDisplayName } from './adoptionHint'
 import { StatusPill } from './AdoptionEditor'
-import { alreadySettled, matchStrength, shortHint } from './adoptionMatch'
+import { alreadySettled, inOtherFormatRoot, matchStrength, preselectable, shortHint } from './adoptionMatch'
 import type { Outcome } from './adoptionReducer'
 import { rowCls, cellCls, actionCellCls } from './adoptionStyles'
 
@@ -41,13 +41,30 @@ const AdoptionRow = forwardRef<HTMLTableRowElement, Props>(function AdoptionRow(
 ) {
   const { t } = useTranslation()
   const name = unitDisplayName(item)
-  const top = item.candidates[0]
-  const strength = matchStrength(item)
+  // With an author conflict a folder author's look alike is not offered here;
+  // the row says which authors disagree instead (#2942).
+  const top = preselectable(item)
+  const strength = matchStrength(item, top)
   const full = adoptionHint(item, t)
   const tooltip = [full.sentence, full.tooltip].filter(Boolean).join('\n')
+  // The hint line is one short phrase; the full explanation used to live only
+  // in a hover tooltip, which touch screens never show. Tapping the phrase
+  // reveals it inline.
+  const [hintOpen, setHintOpen] = useState(false)
+  const hintId = useId()
   const size = formatBytes(item.sizeBytes)
   const pending = item.state === 'pending' && !outcome
   const authorFirst = pending && !inGroup && !top && item.reason === 'author_not_in_library' && item.parsedAuthor !== ''
+  // A file too small to be a book cannot be adopted (the server refuses it),
+  // so its one action is Ignore (#2944).
+  const tooSmall = pending && item.reason === 'too_small'
+  // Which folder a row sits in matters when it is the other format's: an
+  // ebook under the audiobooks root is not an ordinary ebook row (#2944).
+  const rootLabel = inOtherFormatRoot(item)
+    ? item.rootFormat === 'audiobook'
+      ? t('adoption.row.inAudiobookRoot', 'In your audiobooks folder')
+      : t('adoption.row.inEbookRoot', 'In your ebooks folder')
+    : ''
 
   const outcomeLine = (() => {
     switch (outcome?.kind) {
@@ -72,7 +89,7 @@ const AdoptionRow = forwardRef<HTMLTableRowElement, Props>(function AdoptionRow(
   if (pending) {
     if (strength === 'strong' || authorFirst) menu.push({ label: t('adoption.choose', 'Choose book'), onSelect: () => onOpen(false) })
     if (item.fileCount > 1) menu.push({ label: t('adoption.showFiles', 'Show files'), onSelect: () => onOpen(true) })
-    menu.push({ label: t('adoption.ignore', 'Ignore'), onSelect: onIgnore })
+    if (!tooSmall) menu.push({ label: t('adoption.ignore', 'Ignore'), onSelect: onIgnore })
   }
 
   let primary: React.ReactNode
@@ -86,6 +103,8 @@ const AdoptionRow = forwardRef<HTMLTableRowElement, Props>(function AdoptionRow(
         {item.state === 'ignored' ? t('adoption.unignore', 'Unignore') : t('adoption.undo', 'Undo')}
       </button>
     )
+  } else if (tooSmall) {
+    primary = <button type="button" onClick={onIgnore} aria-keyshortcuts="i" className={`${btn.secondary} ${btnSize.sm}`}>{t('adoption.ignore', 'Ignore')}</button>
   } else if (strength === 'strong') {
     primary = <button type="button" onClick={onConfirm} className={`${btn.primary} ${btnSize.sm}`}>{t('adoption.confirm', 'Confirm')}</button>
   } else if (authorFirst) {
@@ -107,8 +126,13 @@ const AdoptionRow = forwardRef<HTMLTableRowElement, Props>(function AdoptionRow(
         <div className="flex min-w-0 items-center gap-2">
           <span className="truncate font-medium text-slate-800 dark:text-zinc-200">{name}</span>
           <MediaBadge type={item.format} />
+          {rootLabel && (
+            <span className="shrink-0 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-800 dark:bg-amber-950 dark:text-amber-300" title={item.rootPath}>
+              {rootLabel}
+            </span>
+          )}
         </div>
-        <p className="mt-0.5 truncate text-xs text-fg-muted" title={`${item.rootPath}/${item.relPath}`}>
+        <p className="mt-0.5 break-all text-xs text-fg-muted md:truncate" title={`${item.rootPath}/${item.relPath}`}>
           <span className="tabular-nums">
             {t('adoption.row.files', { count: item.fileCount, defaultValue: '{{count}} files' })}{size ? ` · ${size}` : ''}
           </span>
@@ -141,14 +165,26 @@ const AdoptionRow = forwardRef<HTMLTableRowElement, Props>(function AdoptionRow(
           // The group row above already says why; repeating it per book is noise.
           <span className="sr-only">{shortHint(item, t)}</span>
         ) : (
-          <p className="truncate text-xs text-fg-muted" title={tooltip}>{shortHint(item, t)}</p>
+          <div className="text-xs text-fg-muted">
+            <button
+              type="button"
+              onClick={() => setHintOpen(v => !v)}
+              aria-expanded={hintOpen}
+              aria-controls={hintId}
+              title={tooltip}
+              className="max-w-full truncate text-left underline decoration-dotted underline-offset-2 hover:text-slate-700 dark:hover:text-zinc-300"
+            >
+              {shortHint(item, t)}
+            </button>
+            <p id={hintId} hidden={!hintOpen} className="mt-0.5 whitespace-pre-line break-words">{tooltip}</p>
+          </div>
         )}
         {note === 'keptBook' && (
           <p role="status" className="mt-0.5 truncate text-xs text-fg-muted" title={t('adoption.outcome.keptBook', 'Files removed. The book stayed because it is now in use.')}>
             {t('adoption.outcome.keptBook', 'Files removed. The book stayed because it is now in use.')}
           </p>
         )}
-        {error && <p role="alert" className="mt-0.5 truncate text-xs text-red-600 dark:text-red-400" title={error}>{error}</p>}
+        {error && <p role="alert" className="mt-0.5 break-words text-xs text-red-600 dark:text-red-400">{error}</p>}
       </td>
       <td className={actionCellCls}>
         <div className="flex items-center gap-1.5 md:justify-end">

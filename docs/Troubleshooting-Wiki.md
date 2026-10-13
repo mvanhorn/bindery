@@ -54,7 +54,7 @@ If your platform can't run a different command, set `BINDERY_DB_FK_CHECK=report`
 
 ## A grabbed book never imports
 
-The book shows **grabbed** in History and reaches 100% in your download client, but Bindery never imports it. Usually one of two causes.
+The book shows **grabbed** in History and reaches 100% in your download client, but Bindery never imports it. Usually one of the causes below.
 
 ### qBittorrent 5.x with an old Bindery
 
@@ -63,6 +63,12 @@ qBittorrent 5.x changed the reply it sends when a torrent is added: 4.x answered
 You may see `add torrent failed: {"added_torrent_ids":...}` or `failed to send to downloader`. Because Bindery believes the hand-off failed, it never records the download, so it is never imported and no `importFailed` event appears.
 
 **Fix:** upgrade to Bindery **1.12.1 or later** (the current release is recommended). Bindery 1.11.0 and earlier cannot complete torrent grabs against qBittorrent 5.x at all — it is a hard incompatibility. After upgrading, re-grab anything that was stuck.
+
+### The file is in a language your profile does not allow
+
+The Queue row is **importBlocked** with a message like `file declares Swedish (swe), but the metadata profile "Standard" allows only English (eng)`. The release name did not say its language, so it passed the search filter, but the EPUB inside declares one the author's metadata profile does not allow. Bindery placed nothing, added the release to the Blocklist and left the book Wanted, so the next search picks a different release on its own. See [the file's language is checked at import](User-Guide-Wiki.md#from-wanted-to-your-library) for the full rule.
+
+If the file is what you want after all, press **Match to book** on the row and pick the book, or import it through **Import → From a folder**; a manual import is never refused for its language. To accept more languages for this author from now on, add them to the metadata profile, or set it to any language. Releases already blocklisted for this stay there until you remove them in **Settings → Blocklist**.
 
 ### Bindery cannot read the completed files
 
@@ -97,7 +103,7 @@ If the files never appear, it does not wait forever: after about 30 minutes of f
 Clicking **Grab** on a release you already have a Queue entry for is refused with *already grabbed*, and the message now names the state that entry is in.
 
 - **`importFailed`** — the scanner is still working on that download. Use **Queue → Retry import** to re-run the import against the files it already has, or remove the Queue entry if you want to grab the release fresh. If its files are simply not there, it turns into `importBlocked` (see above) and becomes re-grabbable on its own.
-- **`imported`**: you already have it. If you have since deleted that book (or its author), the release is no longer held: grabbing it again goes through and reuses the old Queue entry, and automatic search will pick it too once you add the book back. Usually you can leave your download client as it is; the two exceptions are under the table. What happens next depends on the client:
+- **`imported`**: you already have it. If that import left nothing usable, Bindery asks whether to **Grab anyway** (on the Search page, a book's search results and the Wanted page). Confirming reuses the old Queue entry and sends the release to your download client again. Nothing is removed from the client, and the grab does not touch the files the book already has. Use it only when the earlier files are missing: while they still exist, the importer's duplicate checks skip the new download, so it cannot replace them or give you a second copy. Over the API, send the same grab again with `"force": true`; the refusal says whether that is allowed with `"forceAvailable": true`, which is only ever set for your own imported release, never for one still downloading or importing. If you have since deleted that book (or its author), the release is no longer held at all: grabbing it again goes through without asking and reuses the old Queue entry, and automatic search will pick it too once you add the book back. Either way, usually you can leave your download client as it is; the two exceptions are under the table. What happens next depends on the client:
 
   | Client | If it still has the release |
   |---|---|
@@ -115,7 +121,26 @@ Clicking **Grab** on a release you already have a Queue entry for is refused wit
 
 Automatic search applies a narrower rule than the Grab button. A Queue row stops the sweep from grabbing that release again when it is in flight, when it is imported into a book you still have, or when it is `importBlocked`. A `failed` row does not: six hours after it failed, the next sweep grabs the release again and reuses the same Queue row, with the old error message, import path and client id cleared.
 
-The six hour wait counts from the failure itself, not from when the download was added or started. A torrent grabbed at noon that your client gives up on at ten in the evening is retried from ten in the evening. The wait is there because a release that fails at the download client usually fails again the moment it is re-sent, and nothing blocklists it automatically, so without the wait a bad release would be re-grabbed on every sweep. Clicking **Grab**, or **Retry download** on the row (below), has no wait and retries straight away.
+The six hour wait counts from the failure itself, not from when the download was added or started. A torrent grabbed at noon that your client gives up on at ten in the evening is retried from ten in the evening. The wait is there because a release that fails at the download client often fails again the moment it is re-sent, so without the wait a bad release would be re-grabbed on every sweep. Clicking **Grab**, or **Retry download** on the row (below), has no wait and retries straight away.
+
+When the download client says the release itself is broken, Bindery does not wait at all: it adds the release to the Blocklist, and the next search picks a different one. The Blocklist entry's reason names the client's verdict, for example `downloadFailed: FAILURE/PAR`. That covers these failures:
+
+| Client | Blocklisted |
+|---|---|
+| NZBGet | `FAILURE/PAR`, `FAILURE/UNPACK`, `FAILURE/HEALTH`, `FAILURE/SCAN`, and `FAILURE/BAD` (marked bad by you or by a script) |
+| SABnzbd | Missing articles (*Aborted, cannot be completed*, *Not on your server(s)*, *Download might fail*), a failed repair, an unpack that failed with a CRC error, a missing volume or a password, a corrupt or unusable RAR, failed verification, and a job aborted for encryption or an unwanted extension |
+
+Everything else keeps the six hour retry, because it says nothing about the release: SABnzbd running out of disk, a failed move (NZBGet's `FAILURE/MOVE`), a job you deleted by hand, NZBGet's duplicate handling, a script error, or a grab that never reached the client. SABnzbd's messages are matched in English; with SABnzbd set to another language its failures all keep the retry. Remove an entry under **Settings → Blocklist** to let that release be grabbed again.
+
+NZBGet does not keep its own problems apart from the release's. A missing or misconfigured unrar or 7z, a full disk while unpacking, a folder it cannot write, or a par2 memory error also end as `FAILURE/UNPACK`, `FAILURE/PAR` or `FAILURE/SCAN`, and then every job fails, not just one. `FAILURE/HEALTH` and `FAILURE/BAD` have no such cause, so they are always blocklisted. For the other three Bindery looks for evidence before it blocklists:
+
+1. **The job's log in NZBGet.** A CRC error, a missing volume, too little repair data, or a par check skipped for poor health means the release is broken, and it is blocklisted. A line such as `Unrar: Could not start /usr/bin/unrar` (a post processing script that will not start does not count), `Unrar error code: 8`, `Could not move file` or a par2 `out of memory` means the problem is on NZBGet's side: the release is not blocklisted, and that step stops being blocklisted for the client until NZBGet completes it again. This needs NZBGet's per job log, which is on by default (`NzbLog=yes`).
+2. **NZBGet's own tool check** (NZBGet 24 and later). When an unpack failure has nothing in its log, and when you add, save or test the client, Bindery asks NZBGet whether it can find UnRAR and 7-Zip, and reuses the answer for six hours (the check is not free: NZBGet runs the tools and looks up its public address to answer it). If UnRAR is missing, the client shows an error saying so, and unpack failures are not blocklisted until it is found. A missing 7-Zip on its own is only logged, since NZBGet's default 7-Zip setting is often not installed and RAR releases do not need it.
+3. **A count, when the log says nothing.** When three different releases from one client fail the same step within two hours and none completes that step in between, Bindery stops blocklisting that step for that client.
+
+Each of these is per step: a paused unpack step never stops `FAILURE/HEALTH` or `FAILURE/PAR` from being blocklisted. While a step is paused, the client shows a warning under **Settings → Download Clients**, the log has a `WARN` line, and its failed downloads are retried after six hours as usual. It resumes when NZBGet completes that step again (a download that NZBGet actually unpacked, for the unpack step; a completed plain epub does not count), or when you save or disable the client. When it was the count that paused it, the first two releases are already on the Blocklist; remove them there if NZBGet was at fault.
+
+SABnzbd needs none of this: it refuses to start downloading without unrar, skips 7-Zip archives when 7-Zip is missing, and reports a full disk or a failed move with its own messages, so its content failures are always blocklisted.
 
 `importBlocked` is deliberately left to you. Those files downloaded fine and are still on disk; what failed was the import. The sweep cannot tell whether they are still there, and re-downloading them would fetch bytes you already have and leave the old torrent in your client with nothing tracking it, so a blocked row is only ever re-grabbed when you ask for it. Use **Retry import** if the files are still in place, and **Grab** if they are gone.
 
@@ -123,7 +148,7 @@ Earlier releases let a failed row block the release permanently, and the skip wa
 
 ### Retrying a download that failed
 
-A Queue row in `failed` never produced a file: the grab did not reach the download client, or the client gave up on it. There is nothing to import, so **Retry import** does not apply and is not offered. Use **Retry download** on the row instead. It sends the same release to your download client again, which is the right move when the cause was transient (the client was down, the indexer answered 429 or 500). It deliberately does not search for a different release; when the release itself is gone, search the book and grab another one, or blocklist this one first.
+A Queue row in `failed` never produced a file: the grab did not reach the download client, or the client gave up on it. There is nothing to import, so **Retry import** does not apply and is not offered. Use **Retry download** on the row instead. It sends the same release to your download client again, which is the right move when the cause was transient (the client was down, the indexer answered 429 or 500). It deliberately does not search for a different release; when the release itself is gone, search the book and grab another one, or blocklist this one first. A release NZBGet or SABnzbd failed as broken is already on the Blocklist (see above), so a search moves past it on its own; **Retry download** still sends it if you ask.
 
 To retry in bulk, tick the rows and use **Retry selected**, or use **Retry all failed** above the list, which covers both stages: an import failure has its import re-armed, a failed download has its release re-sent. Both ask for confirmation when a re-send is in the batch, because that hands work back to your download client.
 
@@ -297,11 +322,11 @@ Bindery's primary metadata provider is OpenLibrary, DNB (the German national lib
 
 Hardcover does not have to be the primary provider for its titles to show up: it always runs as a **search enricher** too. The Add to library dialog (behind both **Add Author** and **Add Book**) fans the query out to the primary provider **plus** Hardcover (and Google Books, if an API key is set), then merges in any titles the primary didn't return. Books that only exist on hardcover.app are exactly what that path is meant to surface.
 
-The catch is that **Hardcover's GraphQL API requires an API token for every query, including search** — an unauthenticated request returns `{"error":"Unable to verify token"}`. With no token saved, Bindery skips Hardcover before sending anything, so it contributes nothing silently and you only see OpenLibrary / DNB results. Startup says so too: the log reads `hardcover enrichment idle: no api token configured` instead of `hardcover enrichment enabled`. Saving a token takes effect on the next lookup, with no restart.
+The catch is that **Hardcover's GraphQL API requires an API token for every query, including search**: an unauthenticated request returns `{"error":"Unable to verify token"}`. With no token saved, Bindery skips Hardcover before sending anything, so it contributes nothing silently and you only see OpenLibrary / DNB results. Startup says so too: the log reads `hardcover enrichment idle: no api token configured` after the `metadata providers configured` line. Saving a token takes effect on the next lookup, with no restart.
 
 **Fix:** add a Hardcover API token in `Settings → API Keys` (the same token used for [Enhanced Hardcover Series](./Hardcover-Series-Wiki.md) and wishlist features), then re-run the search. Hardcover-only titles should appear in the merged results.
 
-If you want Hardcover to *define* author catalogues rather than only add to them, set it as the primary provider in `Settings → Metadata Profiles → Library Defaults` and restart. The option stays disabled until a token is saved, and clearing the token is refused while Hardcover is primary — a tokenless Hardcover primary would fail every lookup. If the token is removed out-of-band (direct DB edit, restored backup), Bindery logs a warning at startup and falls back to OpenLibrary rather than booting with dead metadata.
+If you want Hardcover to *define* author catalogues rather than only add to them, set it as the primary provider in `Settings → Metadata Profiles → Library Defaults`. The change applies to the next lookup, with no restart. The option stays disabled until a token is saved, and clearing the token is refused while Hardcover is primary, because a tokenless Hardcover primary would fail every lookup. If the token is removed out of band (direct DB edit, restored backup), Bindery logs a warning at startup and falls back to OpenLibrary rather than booting with dead metadata; saving a token again switches the primary back to Hardcover straight away.
 
 If results still don't appear with a token saved, confirm the instance has outbound HTTPS access to `api.hardcover.app` and that the token is valid (a bad token produces the same "Unable to verify token" error, which is logged and skipped).
 
@@ -446,7 +471,7 @@ Filter down to the problem first — level, component, a search term, and a date
 Notes:
 
 - One entry per line, `timestamp LEVEL [component] message key=value`, so it stays greppable and pastes cleanly into an issue.
-- API keys, tracker passkeys, tokens and signatures that appear in logged URLs, and the token in a Discord, Slack, Telegram, Teams, Home Assistant, Apprise or ntfy.sh webhook URL, are replaced with `REDACTED` on the way out. Still skim the file before posting, since paths and book titles are not redacted.
+- API keys, tracker passkeys, tokens and signatures that appear in logged URLs, and the token in a Discord, Slack, Telegram, Teams, Home Assistant, Apprise or ntfy.sh webhook URL, are replaced with `REDACTED` on the way out, as are passkeys and download tokens that private trackers put in the URL path and `user:pass@` credentials written into a URL. Still skim the file before posting, since paths and book titles are not redacted.
 - An export stops at 50,000 entries and says so in the last line of the file. If you hit that, narrow the level or the date range.
 - Admin-only, like the rest of the Logs tab.
 - Turn the **Runtime level** up to `DEBUG` before reproducing if the default output isn't enough; entries are persisted, so the download picks them up after the fact.

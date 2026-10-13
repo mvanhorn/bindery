@@ -73,7 +73,8 @@ func (f adoptionFixture) write(t *testing.T, rel string) string {
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(p, []byte("book"), 0o644); err != nil {
+	// Book sized: adoption refuses an ebook too small to be a book (#2944).
+	if err := os.WriteFile(p, bytes.Repeat([]byte("book "), 2<<10), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	return p
@@ -298,6 +299,85 @@ func TestAdopt_RefusesAFileAnotherBookOwns(t *testing.T) {
 	}
 	if got := filePaths(t, f.books, target.ID); len(got) != 0 {
 		t.Fatalf("target gained %v", got)
+	}
+}
+
+// TestAdopt_FileTakenAfterTheCheckIs409: another book takes the file between
+// the ownership check and the write (#2937). The write used to be an OR
+// IGNORE that reported "not inserted" and the adopt succeeded with nothing
+// registered; it is now the same 409 as the check, with nothing left behind.
+func TestAdopt_FileTakenAfterTheCheckIs409(t *testing.T) {
+	f := newAdoptionFixture(t, &stubMetaProvider{name: "openlibrary"})
+	thief := f.seedBook(t, "Provenance")
+	target := f.seedBook(t, "Translation State")
+	path := f.write(t, "Ann Leckie/Translation State.epub")
+	id := f.seedUnit(t, db.UnmatchedUnitScan{UnitPath: path, MemberPaths: []string{path}})
+
+	real := f.h.registerFile
+	f.h.registerFile = func(ctx context.Context, bookID int64, format, p string) (bool, error) {
+		if err := f.books.AddBookFile(ctx, thief.ID, format, p); err != nil {
+			t.Errorf("concurrent claim: %v", err)
+		}
+		return real(ctx, bookID, format, p)
+	}
+	rec := f.post(t, fmt.Sprintf("/library/unmatched/%d/adopt", id), map[string]any{"bookId": target.ID})
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("adopt = %d %s, want 409", rec.Code, rec.Body.String())
+	}
+	if got := filePaths(t, f.books, target.ID); len(got) != 0 {
+		t.Fatalf("target gained %v", got)
+	}
+	if got := filePaths(t, f.books, thief.ID); len(got) != 1 {
+		t.Fatalf("concurrent owner's row = %v, want it kept", got)
+	}
+	if u, _ := f.units.Get(context.Background(), id); u.State != db.UnmatchedStatePending {
+		t.Fatalf("unit state = %s, want pending", u.State)
+	}
+}
+
+// TestAdopt_FileLeftByADeletedBookIsAdopted: a book_files row whose book no
+// longer exists (foreign keys lost, #1727) belongs to nobody, and download and
+// manual import take such a row over since #2937. Adoption refused it with a
+// 409 that named no book, because its pre-check counted the dead row as an
+// owner. It now adopts and the row is the target's.
+func TestAdopt_FileLeftByADeletedBookIsAdopted(t *testing.T) {
+	f := newAdoptionFixture(t, &stubMetaProvider{name: "openlibrary"})
+	gone := f.seedBook(t, "Provenance (old)")
+	target := f.seedBook(t, "Provenance")
+	path := f.write(t, "Ann Leckie/Provenance.epub")
+	if err := f.books.AddBookFile(context.Background(), gone.ID, models.MediaTypeEbook, path); err != nil {
+		t.Fatal(err)
+	}
+	orphanBook(t, f.db, gone.ID)
+	id := f.seedUnit(t, db.UnmatchedUnitScan{UnitPath: path, MemberPaths: []string{path}})
+
+	rec := f.post(t, fmt.Sprintf("/library/unmatched/%d/adopt", id), map[string]any{"bookId": target.ID})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("adopt = %d %s, want 200", rec.Code, rec.Body.String())
+	}
+	if got := filePaths(t, f.books, target.ID); len(got) != 1 || got[0] != path {
+		t.Fatalf("target files = %v, want the dead book's row taken over", got)
+	}
+}
+
+// TestAdopt_FileOfALiveBookIsStill409 guards the other side: a row another
+// existing book holds is still refused.
+func TestAdopt_FileOfALiveBookIsStill409(t *testing.T) {
+	f := newAdoptionFixture(t, &stubMetaProvider{name: "openlibrary"})
+	owner := f.seedBook(t, "Provenance (other)")
+	target := f.seedBook(t, "Provenance")
+	path := f.write(t, "Ann Leckie/Provenance.epub")
+	if err := f.books.AddBookFile(context.Background(), owner.ID, models.MediaTypeEbook, path); err != nil {
+		t.Fatal(err)
+	}
+	id := f.seedUnit(t, db.UnmatchedUnitScan{UnitPath: path, MemberPaths: []string{path}})
+
+	rec := f.post(t, fmt.Sprintf("/library/unmatched/%d/adopt", id), map[string]any{"bookId": target.ID})
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("adopt = %d %s, want 409", rec.Code, rec.Body.String())
+	}
+	if got := filePaths(t, f.books, owner.ID); len(got) != 1 {
+		t.Fatalf("owner's row = %v, want it kept", got)
 	}
 }
 

@@ -11,13 +11,17 @@ import FilterPopover, { FilterGroup } from '../components/FilterPopover'
 import MoreMenu from '../components/MoreMenu'
 import Pagination from '../components/Pagination'
 import { useServerPagination } from '../components/usePagination'
+import { oneOf, useListParams, useUrlSearchInput } from '../components/useListParams'
 import ViewToggle from '../components/ViewToggle'
 import BulkNotice from '../components/BulkNotice'
 import { isAutoGrabRefusal } from '../util/autoGrabRefusal'
 import { useView } from '../components/useView'
 import SetupChecklist from '../components/SetupChecklist'
 import { btn, btnSize } from '../components/buttons'
+import { useIsAdmin } from '../auth/AuthContext'
 import Switch from '../components/Switch'
+import { ModalPanel } from '../components/useModal'
+import CoverImage from '../components/CoverImage'
 
 // 'az' | 'za' sort by name and back the existing toolbar buttons; the rest are
 // the column-header sorts (#1349), whitelisted server-side by authorSortOrder.
@@ -30,8 +34,16 @@ type SortMode =
   | 'monitored-asc' | 'monitored-desc'
 type MonitoredFilter = '' | 'monitored' | 'unmonitored'
 
+const SORT_MODES: readonly SortMode[] = [
+  'az', 'za', 'name-az', 'name-za', 'recent', 'books-asc', 'books-desc',
+  'rating-asc', 'rating-desc', 'monitored-asc', 'monitored-desc',
+]
+// Query-string keys and their defaults; defaults stay out of the URL.
+const LIST_DEFAULTS = { q: '', sort: 'az' }
+
 export default function AuthorsPage() {
   const { t } = useTranslation()
+  const isAdmin = useIsAdmin()
   const { confirm, confirmDialog } = useConfirmDialog()
   const navigate = useNavigate()
   const [authors, setAuthors] = useState<Author[]>([])
@@ -59,16 +71,28 @@ export default function AuthorsPage() {
   // did before it could write the field at all (#2065).
   const [bulkMonitorNewItems, setBulkMonitorNewItems] = useState<MonitorNewItems | ''>('')
   const [bulkMonitorModeError, setBulkMonitorModeError] = useState<string | null>(null)
-  const [search, setSearch] = useState('')
-  const [debouncedSearch, setDebouncedSearch] = useState('')
-  const [sort, setSort] = useState<SortMode>('az')
-  const [monitoredFilter, setMonitoredFilter] = useState<MonitoredFilter>(() => {
+  // Page, search and sort live in the URL so going back from an author lands
+  // on the same page of the same list (#3052). The monitored filter, view and
+  // page size stay in localStorage as preferences that already survive it.
+  const list = useListParams(LIST_DEFAULTS)
+  const sort = oneOf(list.values.sort, SORT_MODES, 'az')
+  const debouncedSearch = list.values.q
+  const updateList = list.update
+  const setSort = (next: SortMode) => updateList({ sort: next, page: null })
+  // Keystroke-level changes replace the history entry instead of pushing one.
+  const commitSearch = useCallback((q: string) => updateList({ q, page: null }, { replace: true }), [updateList])
+  const [search, setSearch] = useUrlSearchInput(debouncedSearch, commitSearch)
+  const [monitoredFilter, setMonitoredFilterState] = useState<MonitoredFilter>(() => {
     try {
       const v = localStorage.getItem('bindery.filter.authors.monitored')
       if (v === 'monitored' || v === 'unmonitored') return v
     } catch { /* ignore */ }
     return ''
   })
+  const setMonitoredFilter = (next: MonitoredFilter) => {
+    setMonitoredFilterState(next)
+    updateList({ page: null })
+  }
   const [view, setView] = useView('authors', 'grid')
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [bulkBusy, setBulkBusy] = useState(false)
@@ -83,13 +107,23 @@ export default function AuthorsPage() {
   const [refreshing, setRefreshing] = useState(false)
 
   const monitoredParam = monitoredFilter === 'monitored' ? true : monitoredFilter === 'unmonitored' ? false : undefined
-  const { page, pageSize, paginationProps, reset } = useServerPagination(total, 50, 'authors')
+  // The query a total belongs to, minus the page; see BooksPage. The snap
+  // back to the last page only trusts a total fetched for this query.
+  const queryKey = JSON.stringify([debouncedSearch, sort, monitoredFilter])
+  const [totalKey, setTotalKey] = useState<string | null>(null)
+  const loadRequestRef = useRef(0)
+  const { page, pageSize, paginationProps } = useServerPagination(total, 50, 'authors', {
+    page: list.page,
+    setPage: list.setPage,
+    ready: !loading && totalKey === queryKey,
+  })
 
   // Server-side list: page, page size, search, sort, and the monitored filter
   // are all applied by the API, so libraries with >100 authors are fully
   // reachable (issue #1010). load() refetches the current page; the mutation
   // handlers below call it to refresh.
   const load = useCallback(() => {
+    const request = ++loadRequestRef.current
     setLoading(true)
     api.listAuthors({
       limit: pageSize,
@@ -97,21 +131,26 @@ export default function AuthorsPage() {
       search: debouncedSearch || undefined,
       sort,
       monitored: monitoredParam,
-    }).then(({ items, total }) => { setAuthors(items); setTotal(total) })
-      .catch(console.error)
+    }).then(({ items, total }) => {
+      setAuthors(items)
+      setTotal(total)
+      if (request === loadRequestRef.current) setTotalKey(queryKey)
+    })
+      .catch(err => {
+        if (request === loadRequestRef.current) setTotalKey(null)
+        console.error(err)
+      })
       .finally(() => setLoading(false))
-  }, [page, pageSize, debouncedSearch, sort, monitoredParam])
+  }, [page, pageSize, debouncedSearch, sort, monitoredParam, queryKey])
+
+  // A selection only means something on the page it was made on.
+  useEffect(() => { setSelectedIds(new Set()) }, [page, queryKey])
 
   useEffect(() => { load() }, [load])
 
-  // Debounce the search box so typing does not fire a request per keystroke.
-  useEffect(() => {
-    const id = setTimeout(() => setDebouncedSearch(search.trim()), 300)
-    return () => clearTimeout(id)
-  }, [search])
-
-  // Jump back to page 1 whenever the query changes.
-  useEffect(() => { reset() }, [debouncedSearch, sort, monitoredFilter, pageSize, reset])
+  // The search box is debounced into the URL (useUrlSearchInput). Every query
+  // change drops the page param in the same update, which is the jump back to
+  // page 1; an effect would also fire on mount and lose the page from the URL.
 
   // Restore the last-known refresh status on mount so the banner survives a
   // page reload. If a job is still "running", resume polling.
@@ -343,7 +382,7 @@ export default function AuthorsPage() {
   // click on the same column flips to descending. Both keys are whitelisted
   // server-side, so an unknown value can only ever fall back to the name sort.
   const toggleSort = (asc: SortMode, desc: SortMode) =>
-    setSort(prev => (prev === asc ? desc : asc))
+    setSort(sort === asc ? desc : asc)
 
   const SortableHeader = ({ label, asc, desc }: { label: string; asc: SortMode; desc: SortMode }) => {
     const active = sort === asc || sort === desc
@@ -413,12 +452,15 @@ export default function AuthorsPage() {
           >
             {t('addToLibrary.addBook')}
           </button>
-          <button
-            onClick={() => setShowAddSeries(true)}
-            className="px-4 py-2 bg-slate-200 dark:bg-zinc-800 hover:bg-slate-300 dark:hover:bg-zinc-700 rounded-md text-sm font-medium transition-colors"
-          >
-            Add Series
-          </button>
+          {/* Creating a series is admin only (#468). */}
+          {isAdmin && (
+            <button
+              onClick={() => setShowAddSeries(true)}
+              className="px-4 py-2 bg-slate-200 dark:bg-zinc-800 hover:bg-slate-300 dark:hover:bg-zinc-700 rounded-md text-sm font-medium transition-colors"
+            >
+              {t('series.addSeries')}
+            </button>
+          )}
           {/* Below `sm` the five buttons wrap and the primary action used to
               land on the second row, under Refresh all metadata, Merge and Add
               Book. `order-first` pulls it to the front of the wrapped group on a
@@ -456,6 +498,7 @@ export default function AuthorsPage() {
       {/* Search & Sort controls */}
       <div className="flex flex-col sm:flex-row gap-3 mb-4">
         <input
+          enterKeyHint="search"
           type="search"
           value={search}
           onChange={e => setSearch(e.target.value)}
@@ -566,17 +609,24 @@ export default function AuthorsPage() {
                     </td>
                     <td className="px-3 py-2">
                       <Link to={`/author/${author.id}`} state={authorNavState(i)} className="flex items-center gap-2">
-                        {author.imageUrl ? (
-                          <img src={author.imageUrl} alt="" className="w-7 h-7 rounded-full object-cover flex-shrink-0" />
-                        ) : (
-                          <div className="w-7 h-7 rounded-full bg-slate-200 dark:bg-zinc-800 flex items-center justify-center text-xs font-bold text-slate-500 dark:text-zinc-600 flex-shrink-0">
-                            {author.authorName.charAt(0)}
-                          </div>
-                        )}
+                        <CoverImage loading="lazy" decoding="async" src={author.imageUrl} alt="" className="w-7 h-7 rounded-full object-cover flex-shrink-0"
+                          fallback={
+                            <div className="w-7 h-7 rounded-full bg-slate-200 dark:bg-zinc-800 flex items-center justify-center text-xs font-bold text-slate-500 dark:text-zinc-600 flex-shrink-0">
+                              {author.authorName.charAt(0)}
+                            </div>
+                          }
+                        />
                         <span className="text-slate-800 dark:text-zinc-200 truncate hover:text-emerald-500">{author.authorName}</span>
                       </Link>
                     </td>
-                    <td className="px-3 py-2 text-slate-600 dark:text-zinc-400 whitespace-nowrap">{author.statistics?.bookCount ?? '—'}</td>
+                    <td
+                      className="px-3 py-2 text-slate-600 dark:text-zinc-400 whitespace-nowrap tabular-nums"
+                      title={author.statistics && author.statistics.bookCount > 0
+                        ? `${t('authors.booksInLibrary', '{{have}} of {{total}} in library', { have: author.statistics.availableBookCount, total: author.statistics.bookCount })}. ${t('authors.booksInLibraryHint', 'A book counts once at least one of its files is in your library.')}`
+                        : undefined}
+                    >
+                      {author.statistics && author.statistics.bookCount > 0 ? `${author.statistics.availableBookCount} / ${author.statistics.bookCount}` : '—'}
+                    </td>
                     {anyRating && (
                       <td className="px-3 py-2 text-slate-600 dark:text-zinc-400 whitespace-nowrap">
                         {author.averageRating > 0 ? `★ ${author.averageRating.toFixed(2)}` : '—'}
@@ -622,18 +672,23 @@ export default function AuthorsPage() {
                   title={`Select ${author.authorName}`}
                 />
                 <Link to={`/author/${author.id}`} state={authorNavState(i)} className="flex gap-3 p-4 hover:bg-slate-200/40 dark:hover:bg-zinc-800/40 transition-colors">
-                  {author.imageUrl ? (
-                    <img src={author.imageUrl} alt={author.authorName} className="w-16 h-16 rounded-full object-cover flex-shrink-0" />
-                  ) : (
-                    <div className="w-16 h-16 rounded-full bg-slate-200 dark:bg-zinc-800 flex items-center justify-center flex-shrink-0 text-xl font-bold text-slate-500 dark:text-zinc-600">
-                      {author.authorName.charAt(0)}
-                    </div>
-                  )}
+                  <CoverImage loading="lazy" decoding="async" src={author.imageUrl} alt={author.authorName} className="w-16 h-16 rounded-full object-cover flex-shrink-0"
+                    fallback={
+                      <div className="w-16 h-16 rounded-full bg-slate-200 dark:bg-zinc-800 flex items-center justify-center flex-shrink-0 text-xl font-bold text-slate-500 dark:text-zinc-600">
+                        {author.authorName.charAt(0)}
+                      </div>
+                    }
+                  />
                   <div className="min-w-0">
                     <h3 className="font-semibold truncate">{author.authorName}</h3>
                     <p className="text-xs text-slate-600 dark:text-zinc-500 mt-1 line-clamp-2">
                       {author.description || t('authors.noDescription')}
                     </p>
+                    {author.statistics && author.statistics.bookCount > 0 && (
+                      <p className="text-xs text-slate-600 dark:text-zinc-400 mt-1 tabular-nums">
+                        {t('authors.booksInLibrary', '{{have}} of {{total}} in library', { have: author.statistics.availableBookCount, total: author.statistics.bookCount })}
+                      </p>
+                    )}
                   </div>
                 </Link>
               </div>
@@ -679,8 +734,8 @@ export default function AuthorsPage() {
       />
 
       {monitoringBulkAction && (
-        <div className="fixed inset-0 bg-black/60 flex items-center justify-center p-4 z-50" onClick={() => setMonitoringBulkAction(null)}>
-          <div className="bg-slate-100 dark:bg-zinc-900 border border-slate-300 dark:border-zinc-700 rounded-lg w-full max-w-md shadow-2xl" role="dialog" aria-modal="true" aria-labelledby="bulk-monitoring-title" onClick={e => e.stopPropagation()}>
+        <div className="modal-overlay fixed inset-0 bg-black/60 flex items-center justify-center p-4 z-50" onClick={() => setMonitoringBulkAction(null)}>
+          <ModalPanel onClose={() => setMonitoringBulkAction(null)} canClose={!bulkBusy} labelledBy="bulk-monitoring-title" className="bg-slate-100 dark:bg-zinc-900 border border-slate-300 dark:border-zinc-700 rounded-lg w-full max-w-md shadow-2xl modal-max-h overflow-y-auto" onClick={e => e.stopPropagation()}>
             <div className="p-4 border-b border-slate-200 dark:border-zinc-800">
               <h3 id="bulk-monitoring-title" className="text-lg font-semibold">
                 {monitoringBulkAction === 'monitor' ? t('common.monitor') : t('common.unmonitor')}
@@ -723,13 +778,13 @@ export default function AuthorsPage() {
                 {t('common.apply', 'Apply')}
               </button>
             </div>
-          </div>
+          </ModalPanel>
         </div>
       )}
 
       {showMonitorModeBulk && (
-        <div className="fixed inset-0 bg-black/60 flex items-center justify-center p-4 z-50" onClick={closeBulkMonitorMode}>
-          <div className="bg-slate-100 dark:bg-zinc-900 border border-slate-300 dark:border-zinc-700 rounded-lg w-full max-w-md shadow-2xl" role="dialog" aria-modal="true" aria-labelledby="bulk-monitor-mode-title" onClick={e => e.stopPropagation()}>
+        <div className="modal-overlay fixed inset-0 bg-black/60 flex items-center justify-center p-4 z-50" onClick={closeBulkMonitorMode}>
+          <ModalPanel onClose={closeBulkMonitorMode} canClose={!bulkBusy} labelledBy="bulk-monitor-mode-title" className="bg-slate-100 dark:bg-zinc-900 border border-slate-300 dark:border-zinc-700 rounded-lg w-full max-w-md shadow-2xl modal-max-h overflow-y-auto" onClick={e => e.stopPropagation()}>
             <div className="p-4 border-b border-slate-200 dark:border-zinc-800">
               <h3 id="bulk-monitor-mode-title" className="text-lg font-semibold">{t('authors.bulkSetMonitorModeTitle', 'Set monitor mode')}</h3>
               <p className="text-xs text-slate-600 dark:text-zinc-400 mt-1">
@@ -828,10 +883,10 @@ export default function AuthorsPage() {
                 disabled={bulkBusy}
                 className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed rounded-md text-sm font-medium text-white transition-colors"
               >
-                {bulkBusy ? t('common.saving', 'Saving...') : t('authors.bulkSetMonitorModeApply', 'Apply monitor mode')}
+                {bulkBusy ? t('common.saving', 'Saving…') : t('authors.bulkSetMonitorModeApply', 'Apply monitor mode')}
               </button>
             </div>
-          </div>
+          </ModalPanel>
         </div>
       )}
 
@@ -844,8 +899,8 @@ export default function AuthorsPage() {
       )}
       {showAddSeries && (
         <SeriesNameModal
-          title="Add Series"
-          submitLabel="Add Series"
+          title={t('series.addSeries')}
+          submitLabel={t('series.addSeries')}
           onClose={() => setShowAddSeries(false)}
           onSubmit={handleCreateSeries}
         />

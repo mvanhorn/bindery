@@ -88,12 +88,20 @@ func redactReleaseJSON(raw string) string {
 		return raw
 	}
 	changed := false
+	nzbURL, _ := release["nzbUrl"].(string)
+	guid, _ := release["guid"].(string)
+	redactedNZB, redactedGUID := newznab.RedactDownloadURL(nzbURL), newznab.RedactDownloadURL(guid)
 	for _, key := range []string{"nzbUrl", "guid", "infoUrl"} {
 		v, ok := release[key].(string)
 		if !ok {
 			continue
 		}
-		if redacted := newznab.RedactDownloadURL(v); redacted != v {
+		redacted := newznab.RedactDownloadURL(v)
+		if key == "infoUrl" {
+			// A detail link keeps its path; see redactInfoURL.
+			redacted = redactInfoURL(v, redactedNZB, redactedGUID)
+		}
+		if redacted != v {
 			release[key] = redacted
 			changed = true
 		}
@@ -154,7 +162,11 @@ func (h *PendingHandler) Grab(w http.ResponseWriter, r *http.Request) {
 	}
 
 	pr, err := h.pending.GetByID(r.Context(), id)
-	if err != nil || pr == nil {
+	if err != nil {
+		writeServerError(w, r, err)
+		return
+	}
+	if pr == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "pending release not found"})
 		return
 	}
@@ -211,7 +223,9 @@ func (h *PendingHandler) Grab(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "pending release not found"})
 			return
 		}
-		writeServerError(w, r, err)
+		// A missing client is a 400 the user can fix and a refused send is a
+		// 502, the same as the queue grab route; the rest is a storage fault.
+		writeGrabError(w, r, err)
 		return
 	}
 

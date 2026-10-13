@@ -72,7 +72,7 @@ const SettingDefaultAudiobookRootFolderID = "library.defaultAudiobookRootFolderI
 
 // SettingMetadataPrimaryProvider is the KV key that selects the primary
 // metadata provider used for author/book search and lookup. Valid values are
-// "openlibrary" (default), "dnb", and "hardcover". Empty or unset falls back to
+// "openlibrary" (default), "dnb", "nb", "bnf", and "hardcover". Empty or unset falls back to
 // "openlibrary" for backwards compatibility.
 //
 // "hardcover" requires a Hardcover API token (SettingHardcoverAPIToken) —
@@ -85,7 +85,7 @@ const SettingMetadataPrimaryProvider = "metadata.primary_provider"
 // MetadataPrimaryProviders lists the accepted values of
 // SettingMetadataPrimaryProvider, in the order the UI presents them. The first
 // entry is the default used when the setting is empty or unset.
-var MetadataPrimaryProviders = []string{"openlibrary", "dnb", "hardcover"}
+var MetadataPrimaryProviders = []string{"openlibrary", "dnb", "nb", "bnf", "hardcover"}
 
 // IsMetadataPrimaryProviderValid reports whether value names a provider that
 // may be promoted to primary. The empty string is valid and means "default".
@@ -276,7 +276,47 @@ const (
 )
 
 type SettingsHandler struct {
-	settings *db.SettingsRepo
+	settings   *db.SettingsRepo
+	dailyQuota *hardcover.DailyQuota
+	onChange   SettingsChangeHook
+}
+
+// SettingsChangeHook runs after a setting has been stored (PUT) or removed
+// (DELETE), so a component that read the setting at boot can pick the new
+// value up without a restart. handled reports whether the hook acts on key at
+// all; err reports that it does but could not apply the change. The write has
+// already succeeded either way and is never rolled back: the hook's error
+// only reaches the log and the response's appliedLive flag.
+type SettingsChangeHook func(ctx context.Context, key string) (handled bool, err error)
+
+// WithDailyQuota shares the same pause with the API test button.
+func (h *SettingsHandler) WithDailyQuota(q *hardcover.DailyQuota) *SettingsHandler {
+	h.dailyQuota = q
+	return h
+}
+
+// WithChangeHook installs the hook every successful write runs. cmd/bindery
+// uses it to rebuild the metadata providers when the primary provider, the
+// Google Books key or the Hardcover token changes (#1771). Without one,
+// writes behave as before and the response carries no appliedLive flag.
+func (h *SettingsHandler) WithChangeHook(hook SettingsChangeHook) *SettingsHandler {
+	h.onChange = hook
+	return h
+}
+
+// runChangeHook runs the hook for key and returns the appliedLive value for
+// the response: nil when nothing acts on key, otherwise whether the change
+// took effect immediately.
+func (h *SettingsHandler) runChangeHook(ctx context.Context, key string) *bool {
+	if h.onChange == nil {
+		return nil
+	}
+	handled, err := h.onChange(ctx, key)
+	if !handled {
+		return nil
+	}
+	applied := err == nil
+	return &applied
 }
 
 func NewSettingsHandler(settings *db.SettingsRepo) *SettingsHandler {
@@ -306,7 +346,9 @@ func NewSettingsHandler(settings *db.SettingsRepo) *SettingsHandler {
 func isSecretSetting(key string) bool {
 	// 1. Explicit one-offs that don't match the patterns below.
 	switch key {
-	case SettingAuthAPIKey,
+	case "auth.hardcover_daily_holds",
+		"auth.hardcover_rejected_holds",
+		SettingAuthAPIKey,
 		SettingAuthSessionSecret,
 		SettingAuthSessionSecretPrevious,
 		SettingAuthMode,
@@ -368,16 +410,60 @@ func isWritableSecretSetting(key string) bool {
 		key == LegacySettingGoogleBooksAPIKey
 }
 
+// SettingRecommendationsEnabled is "true" to run the recommendation engine and
+// show the Discover page's suggestions; anything else (or unset) turns both
+// off. The recommender and scheduler read it as a string literal; keep those in
+// sync with this constant.
+const SettingRecommendationsEnabled = "recommendations.enabled"
+
+// nonAdminReadableSettings is the complete list of settings a non admin may
+// read through GET /api/v1/setting and GET /api/v1/setting/{key} (#2361).
+// Every other key is admin only. It is an allowlist on purpose: the denylist
+// it replaces only covered what somebody had thought to list, and a scan of
+// v1.40.0 found integration base URLs, the Grimmory username and the telemetry
+// install id still readable by any account.
+//
+// Each entry is here because a screen a non admin can open reads it, and the
+// screen copes with the key being absent (it falls back to a default), so a
+// key can be dropped from this list without breaking a page:
+//
+//   - recommendations.enabled: DiscoverPage, to decide whether to show
+//     suggestions.
+//   - metadata.primary_provider: AddToLibraryModal, for the provider notice.
+//   - library.defaultRootFolderId, library.defaultAudiobookRootFolderId,
+//     default.media_type, author.default_monitor_mode and
+//     author.default_monitor_latest_count: authorAddDefaults, which preselects
+//     the add author dialog. Root folder ids are numbers, not paths; the paths
+//     themselves live behind GET /rootfolder.
+//
+// Adding a key here hands its value to every authenticated account, so a new
+// entry needs a non admin screen that reads it and a value that says nothing
+// about the server: no path, URL, hostname, username, id or credential.
+var nonAdminReadableSettings = map[string]bool{
+	SettingRecommendationsEnabled:          true,
+	SettingMetadataPrimaryProvider:         true,
+	SettingDefaultLibraryRootFolderID:      true,
+	SettingDefaultAudiobookRootFolderID:    true,
+	SettingDefaultMediaType:                true,
+	SettingAuthorDefaultMonitorMode:        true,
+	SettingAuthorDefaultMonitorLatestCount: true,
+}
+
 // isAdminOnlySetting reports whether a settings key may only be read by an
-// admin. It is the read-side counterpart of the auth.RequireAdmin gate that
-// already guards PUT and DELETE on /api/v1/setting/{key}: after #2361 an
-// account that cannot write one of these keys cannot read it either.
+// admin. It is the read side counterpart of the auth.RequireAdmin gate that
+// already guards PUT and DELETE on /api/v1/setting/{key}.
+//
+// Since #2361 the default is admin only: a key is readable by a non admin only
+// when it is on nonAdminReadableSettings and is not a secret. That covers the
+// filesystem paths the first #2361 pass reserved by name (calibre and drop
+// folder paths, the two path remaps, the library.lastScan blob) and also
+// everything nobody had listed, such as integration base URLs and usernames,
+// indexer and provider settings, and telemetry.install_id.
 //
 // Relationship to isSecretSetting, which #2361 warns must not drift out of
 // agreement with this function: every secret is admin only by construction,
-// because the first thing here is a delegation to isSecretSetting. The two
-// cannot disagree about whether a key is sensitive, only about how far the
-// hiding goes.
+// because the first thing here is a delegation to isSecretSetting, so a
+// secret stays hidden even if somebody adds it to the allowlist by mistake.
 //
 //   - A secret is hidden from everybody, admins included. Its value has no
 //     reason to travel back to a browser at all, so List omits it and Get 404s.
@@ -385,19 +471,13 @@ func isWritableSecretSetting(key string) bool {
 //     returned intact to an admin, because the Settings screens that own these
 //     keys have to render the stored value for the operator to edit it.
 //
-// Boundary: server filesystem paths are in. GET /system/storage has been admin
-// gated since #1183 on the grounds that it "reveals server filesystem layout",
-// and these keys carry that same information class through an endpoint every
-// authenticated role could read, which is the asymmetry #2361 reports. An OPDS
-// only reader account could ask a stock install where its Calibre library
-// lives on disk.
+// API key requests are stamped admin by auth.Middleware, so a script or third
+// party client using the API key still reads every non secret key.
 //
-// Deliberately out of scope for now: indexer and provider hostnames, and the
-// Audiobookshelf and Calibre plugin base URLs. They are a real disclosure too,
-// but a narrower and less actionable one than an absolute server path, and
-// widening the classifier to cover them wants its own pass over what a non
-// admin screen legitimately needs. #2361 tracks the wider question, including
-// the allowlist inversion that would settle it properly.
+// SettingLibraryLastScan has a second door: GET /api/v1/library/scan/status
+// serves the same blob verbatim. That route is mounted behind
+// auth.RequireAdmin by registerLibraryScanStatusRoute in cmd/bindery (#2361),
+// so both ways to the value are admin only.
 func isAdminOnlySetting(key string) bool {
 	// Every secret is admin only. Stated as a delegation rather than by
 	// re-listing the keys so the two classifiers cannot drift apart: a key
@@ -405,28 +485,7 @@ func isAdminOnlySetting(key string) bool {
 	if isSecretSetting(key) {
 		return true
 	}
-	// Non secret keys whose values are absolute paths on the server, prefix
-	// maps built out of them, or a blob containing both. The issue names the
-	// first four; the two remaps and the scan summary are the same
-	// disclosure in a different shape and are included rather than left for
-	// the next audit to find.
-	//
-	// SettingLibraryLastScan has a second door: GET
-	// /api/v1/library/scan/status serves the same blob verbatim. That route is
-	// mounted behind auth.RequireAdmin by registerLibraryScanStatusRoute in
-	// cmd/bindery (#2361), so both ways to the value are admin only.
-	switch key {
-	case SettingCalibreLibraryPath,
-		SettingCalibreBinaryPath,
-		SettingImportDropFolder,
-		SettingImportAudiobookDropFolder,
-		SettingCWAIngestPath,
-		SettingCalibrePushPathRemap,
-		SettingABSPathRemap,
-		SettingLibraryLastScan:
-		return true
-	}
-	return false
+	return !nonAdminReadableSettings[key]
 }
 
 // callerIsAdmin reports whether the request carries the admin role, read from
@@ -528,17 +587,79 @@ func (h *SettingsHandler) Set(w http.ResponseWriter, r *http.Request) {
 		writeServerError(w, r, err)
 		return
 	}
+	appliedLive := h.runChangeHook(r.Context(), key)
 	if isSecretSetting(key) {
-		writeJSON(w, http.StatusOK, map[string]string{"key": key, "value": ""})
+		resp := map[string]any{"key": key, "value": ""}
+		if appliedLive != nil {
+			resp["appliedLive"] = *appliedLive
+		}
+		writeJSON(w, http.StatusOK, resp)
 		return
 	}
-	s, err := h.settings.Get(r.Context(), key)
-	if err != nil || s == nil {
-		writeJSON(w, http.StatusOK, map[string]string{"key": key, "value": value})
-		return
+	resp := settingSetResponse{Setting: &models.Setting{Key: key, Value: value}, AppliedLive: appliedLive}
+	if s, err := h.settings.Get(r.Context(), key); err == nil && s != nil {
+		resp.Setting = s
 	}
-	writeJSON(w, http.StatusOK, s)
+	resp.Warning, resp.WarningCode = h.settingSaveWarning(r.Context(), key)
+	writeJSON(w, http.StatusOK, resp)
 }
+
+// settingSetResponse is what a setting write answers: the stored setting,
+// and a warning when the value saved but cannot work as configured.
+type settingSetResponse struct {
+	*models.Setting
+	Warning     string `json:"warning,omitempty"`
+	WarningCode string `json:"warningCode,omitempty"`
+	// AppliedLive is present only for a setting something applies at
+	// runtime (today the metadata provider settings, #1771): true when the
+	// change is already in effect, false when it saved but takes effect at
+	// the next restart.
+	AppliedLive *bool `json:"appliedLive,omitempty"`
+}
+
+// warningCalibredbMissing is the warning code for a calibredb write mode
+// with no calibredb where Bindery runs (#1940).
+const warningCalibredbMissing = "calibredb_missing"
+
+// settingSaveWarning checks a just saved setting against the environment.
+//
+// A calibredb write mode is saved even when there is no calibredb to run
+// (#1940), because refusing would leave the user unable to save the mode
+// they will make work by installing Calibre, but saying nothing is how the
+// official image, which has no Calibre at all, came to drop every import on
+// the floor with a successful looking import and a single WARN line. So the
+// save answers with the reason, and the Calibre settings tab shows it.
+func (h *SettingsHandler) settingSaveWarning(ctx context.Context, key string) (string, string) {
+	if key != SettingCalibreMode && key != SettingCalibreBinaryPath {
+		return "", ""
+	}
+	if LoadCalibreMode(ctx, h.settings) != calibre.ModeCalibredb {
+		return "", ""
+	}
+	cfg := LoadCalibreConfig(ctx, h.settings)
+	cfg.Enabled = true
+	client := calibre.New(cfg)
+	if _, err := client.Locate(); err != nil {
+		code := ""
+		if calibre.IsCalibredbUnusable(err) {
+			code = warningCalibredbMissing
+		}
+		return err.Error(), code
+	}
+	// The file is there; whether it starts is another matter on the official
+	// image, where a mounted Calibre install has no libraries to load. Ask it
+	// for its version, briefly, and warn only when it cannot run at all. Any
+	// other trouble, such as the library path, is Test connection's to report.
+	tctx, cancel := context.WithTimeout(ctx, calibredbSaveProbeTimeout)
+	defer cancel()
+	if _, err := client.Test(tctx); calibre.IsCalibredbUnusable(err) {
+		return err.Error(), warningCalibredbMissing
+	}
+	return "", ""
+}
+
+// calibredbSaveProbeTimeout bounds the version check a calibredb save runs.
+const calibredbSaveProbeTimeout = 10 * time.Second
 
 // validateSettingDependencies rejects values that are well-formed on their own
 // but invalid given the rest of the stored configuration. validateSettingValue
@@ -602,8 +723,12 @@ func (h *SettingsHandler) TestHardcover(w http.ResponseWriter, r *http.Request) 
 
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
+	// A user retesting after fixing the token on Hardcover's side must reach
+	// Hardcover even while a rejected token hold is live (#3101). A daily quota
+	// hold still answers without a request.
+	ctx = hardcover.WithRejectedTokenProbe(ctx)
 
-	client := hardcover.New().WithToken(token)
+	client := hardcover.New().WithDailyQuota(h.dailyQuota).WithToken(token)
 	series, err := client.SearchSeries(ctx, "Dune", 3)
 	if err != nil {
 		result.Error = err.Error()
@@ -965,5 +1090,9 @@ func (h *SettingsHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		writeServerError(w, r, err)
 		return
 	}
+	// Deleting metadata.primary_provider puts the default back in force, so
+	// the providers are rebuilt here too. 204 has no body to report it in;
+	// the hook logs a failure.
+	h.runChangeHook(r.Context(), key)
 	w.WriteHeader(http.StatusNoContent)
 }

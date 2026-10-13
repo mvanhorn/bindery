@@ -3,6 +3,7 @@ import { Link, useLocation, useNavigate, useParams } from 'react-router'
 import { useTranslation } from 'react-i18next'
 import { useConfirmDialog } from '../components/useConfirmDialog'
 import { api, ApiError, Author, AuthorAlias, Book, BookBulkAction, MediaType, Series } from '../api/client'
+import { usePolling } from '../components/usePolling'
 import ViewToggle from '../components/ViewToggle'
 import { bookStatusBadge } from '../components/bookStatus'
 import MergeAuthorsModal from '../components/MergeAuthorsModal'
@@ -12,26 +13,45 @@ import RenameFilesModal from '../components/RenameFilesModal'
 import BulkActionBar from '../components/BulkActionBar'
 import { useView } from '../components/useView'
 import MarkdownDescription from '../components/MarkdownDescription'
-import { canLinkAuthorMetadata } from '../util/authorMetadata'
-import { metadataSourceLink } from '../util/metadataSource'
+import { authorProviderKey, canLinkAuthorMetadata } from '../util/authorMetadata'
+import { metadataRetrievedDate, metadataSourceLink } from '../util/metadataSource'
 import { isAutoGrabRefusal } from '../util/autoGrabRefusal'
+import { canonicalLanguage, languageName } from '../util/language'
 import { btn, btnSize } from '../components/buttons'
 import Switch from '../components/Switch'
 import CoverPlaceholder from '../components/CoverPlaceholder'
+import BookRating from '../components/BookRating'
 import MoreMenu from '../components/MoreMenu'
 import Section from '../components/Section'
 import AuthorSyncNotice from '../components/AuthorSyncNotice'
 import CatalogueReconciliationModal from '../components/CatalogueReconciliationModal'
 import DuplicateCandidatesModal from '../components/DuplicateCandidatesModal'
+import CoverImage from '../components/CoverImage'
 
 type MediaFilter = '' | 'ebook' | 'audiobook'
 // 'excluded' folds in what used to be a separate "Show excluded" checkbox. It
 // is a status like any other from the user's point of view, and as a checkbox
 // sitting outside the chip groups it read as belonging to whichever group it
 // happened to wrap next to.
+// A book still wanted (some requested format is missing) that already has a
+// file for another format. It belongs in the library as well as in Wanted.
+const isPartiallyOwned = (b: Book): boolean =>
+  b.status === 'wanted' && !!(b.ebookFilePath || b.audiobookFilePath)
+
 type StatusFilter = '' | 'wanted' | 'imported' | 'skipped' | 'excluded'
 type PublishedFilter = '' | 'released' | 'upcoming'
-type DateSort = 'none' | 'asc' | 'desc'
+type MonitoredFilter = '' | 'monitored' | 'unmonitored'
+// '' keeps the order the API returned. The title and date keys match
+// BooksPage's SortMode; the added-* pair sorts on the row's createdAt.
+type SortMode =
+  | ''
+  | 'title-az' | 'title-za'
+  | 'date-new' | 'date-old'
+  | 'added-new' | 'added-old'
+
+const SORT_MODES: readonly SortMode[] = [
+  '', 'title-az', 'title-za', 'date-new', 'date-old', 'added-new', 'added-old',
+]
 
 const STATUS_FILTERS: readonly StatusFilter[] = [
   '', 'wanted', 'imported', 'skipped', 'excluded',
@@ -85,6 +105,13 @@ interface AuthorNavState {
 // as it was before the click (#2601).
 const REFRESH_POLL_INTERVAL_MS = 2000
 const REFRESH_POLL_TIMEOUT_MS = 60000
+// A sync already running when the page loads (an add's, typically) is polled
+// with no time limit, backing off from 2 s to 10 s: a large catalogue can
+// spend minutes in the provider fetch (#3058).
+const SYNC_POLL_START_MS = 2000
+const SYNC_POLL_MAX_MS = 10000
+// Consecutive failed polls or reloads before the page stops watching a sync.
+const SYNC_POLL_MAX_FAILURES = 3
 
 export default function AuthorDetailPage() {
   const { id } = useParams<{ id: string }>()
@@ -126,6 +153,14 @@ export default function AuthorDetailPage() {
   const [showCatalogueReconciliation, setShowCatalogueReconciliation] = useState(false)
   const [showDuplicateCandidates, setShowDuplicateCandidates] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // The sync poll stopped trying (#3058): a 404/403, or a few failures in a row.
+  const [syncGaveUp, setSyncGaveUp] = useState(false)
+  const syncFailures = useRef(0)
+  const noteSyncFailure = (err: unknown) => {
+    syncFailures.current++
+    const status = err instanceof ApiError ? err.status : 0
+    if (status === 404 || status === 403 || syncFailures.current >= SYNC_POLL_MAX_FAILURES) setSyncGaveUp(true)
+  }
 
   // Bulk multi-select state (#791). Selection is keyed by book.id and
   // intentionally scoped to the filtered view: hidden books can't be
@@ -150,7 +185,10 @@ export default function AuthorDetailPage() {
   // mounted across Previous/Next (only authorId changes), so a plain
   // "already loaded" check on authorSeries.length kept the previous
   // author's series and grouped the new author's books against them.
-  const loadedSeriesAuthorId = useRef<number | null>(null)
+  // Which author and reload the series were loaded for: a manual Refresh
+  // reloads through reloadKey, and its sync can change the series a book is
+  // in, so the grouping is fetched again then too.
+  const loadedSeries = useRef<{ authorId: number; reloadKey: number } | null>(null)
 
   useEffect(() => {
     try { localStorage.setItem('bindery.group.author-detail.series', String(groupBySeries)) } catch { /* ignore */ }
@@ -160,16 +198,19 @@ export default function AuthorDetailPage() {
   // the default flat view never pays for the extra round trip. Failures fall
   // back to an empty set — every book then lands in the Standalone group.
   useEffect(() => {
-    if (!groupBySeries || loadedSeriesAuthorId.current === authorId) return
+    const loaded = loadedSeries.current
+    if (!groupBySeries || (loaded?.authorId === authorId && loaded.reloadKey === reloadKey)) return
     // Drop the previous author's series before fetching, so neither the
     // in flight window nor a failed fetch groups these books against them.
-    setAuthorSeries([])
+    // The same author's stay up while a refresh reload fetches, so the
+    // grouping does not flash every book into Standalone.
+    if (loaded?.authorId !== authorId) setAuthorSeries([])
     let cancelled = false
     api.listAuthorSeries(authorId)
-      .then(s => { if (!cancelled) { setAuthorSeries(s); loadedSeriesAuthorId.current = authorId } })
+      .then(s => { if (!cancelled) { setAuthorSeries(s); loadedSeries.current = { authorId, reloadKey } } })
       .catch(() => { /* leave empty: books fall into Standalone */ })
     return () => { cancelled = true }
-  }, [groupBySeries, authorId])
+  }, [groupBySeries, authorId, reloadKey])
 
   // Filter / sort state — persisted to localStorage under page-scoped keys
   const [typeFilter, setTypeFilter] = useState<MediaFilter>(() => {
@@ -200,12 +241,28 @@ export default function AuthorDetailPage() {
     return ''
   })
 
-  const [dateSort, setDateSort] = useState<DateSort>(() => {
+  const [monitoredFilter, setMonitoredFilter] = useState<MonitoredFilter>(() => {
     try {
-      const v = localStorage.getItem('bindery.sort.author-detail.date')
-      if (v === 'asc' || v === 'desc') return v
+      const v = localStorage.getItem('bindery.filter.author-detail.monitored')
+      if (v === 'monitored' || v === 'unmonitored') return v
     } catch { /* ignore */ }
-    return 'none'
+    return ''
+  })
+
+  // Not persisted: languages differ per author, so a remembered value would
+  // silently empty the list on the next author that lacks it.
+  const [languageFilter, setLanguageFilter] = useState('')
+
+  const [sort, setSort] = useState<SortMode>(() => {
+    try {
+      const v = localStorage.getItem('bindery.sort.author-detail')
+      if (v && (SORT_MODES as readonly string[]).includes(v)) return v as SortMode
+      // The Published-header toggle this replaced stored asc/desc under its own key.
+      const legacy = localStorage.getItem('bindery.sort.author-detail.date')
+      if (legacy === 'asc') return 'date-old'
+      if (legacy === 'desc') return 'date-new'
+    } catch { /* ignore */ }
+    return ''
   })
 
   useEffect(() => {
@@ -221,8 +278,15 @@ export default function AuthorDetailPage() {
   }, [publishedFilter])
 
   useEffect(() => {
-    try { localStorage.setItem('bindery.sort.author-detail.date', dateSort) } catch { /* ignore */ }
-  }, [dateSort])
+    try { localStorage.setItem('bindery.filter.author-detail.monitored', monitoredFilter) } catch { /* ignore */ }
+  }, [monitoredFilter])
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('bindery.sort.author-detail', sort)
+      localStorage.removeItem('bindery.sort.author-detail.date')
+    } catch { /* ignore */ }
+  }, [sort])
 
   useEffect(() => {
     if (author?.authorName) {
@@ -246,11 +310,52 @@ export default function AuthorDetailPage() {
       api.getAuthor(authorId),
       api.listAllBooks({ authorId, includeExcluded: showExcluded }),
     ])
-      .then(([a, bs]) => { if (!cancelled) { setAuthor(a); setBooks(bs) } })
-      .catch(err => setError(err instanceof Error ? err.message : 'Failed to load'))
+      .then(([a, bs]) => {
+        if (cancelled) return
+        setAuthor(a)
+        setBooks(bs)
+        syncFailures.current = 0
+        setSyncGaveUp(false)
+      })
+      .catch(err => {
+        setError(err instanceof Error ? err.message : 'Failed to load')
+        if (!cancelled) noteSyncFailure(err)
+      })
       .finally(() => { if (!cancelled) setLoading(false) })
     return () => { cancelled = true }
   }, [authorId, showExcluded, reloadKey])
+
+  // An author whose catalogue sync is running when the page loads, straight
+  // after an add or after a Refresh poll gave up, is polled until the sync
+  // ends and then reloaded, so the page does not settle on "no books" while
+  // the catalogue is still being fetched (#3058). A manual Refresh runs its
+  // own poll, so this one stands down meanwhile. The poll keeps running until
+  // a reload has actually succeeded (a failed reload leaves the author marked
+  // as syncing, so the next poll reloads again), and gives up on a 404/403 or
+  // after a few failures in a row, so a permanent error ends in the error
+  // state rather than a spinner that never clears.
+  const syncing = !!author?.syncInProgress && author.id === authorId && !refreshing && !syncGaveUp
+  const [pollDelay, setPollDelay] = useState(SYNC_POLL_START_MS)
+  const backOff = () => setPollDelay(d => Math.min(d * 1.5, SYNC_POLL_MAX_MS))
+  usePolling(() => {
+    const session = pageSession.current
+    api.getAuthor(authorId)
+      .then(latest => {
+        if (!session.active) return
+        if (!latest.syncInProgress) {
+          quietReload.current = true
+          setReloadKey(k => k + 1)
+          return
+        }
+        syncFailures.current = 0
+        backOff()
+      })
+      .catch(err => {
+        if (!session.active) return
+        noteSyncFailure(err)
+        backOff()
+      })
+  }, pollDelay, syncing)
 
   // Validated against authorId: stale state (browser back/forward) or no
   // state at all (opened from elsewhere) must read as "no nav info", not
@@ -497,6 +602,16 @@ export default function AuthorDetailPage() {
     }
   }
 
+  // The Language select only appears when this author's books span more than
+  // one language; a stale pick for a language no longer present is ignored.
+  // Codes are folded first, so "en" and "eng" rows are one English option.
+  const languages = useMemo(
+    () => Array.from(new Set(books.map(b => canonicalLanguage(b.language)).filter(Boolean)))
+      .sort((a, b) => (languageName(a) ?? a).localeCompare(languageName(b) ?? b)),
+    [books],
+  )
+  const activeLanguage = languages.length > 1 && languages.includes(languageFilter) ? languageFilter : ''
+
   const filteredBooks = useMemo(() => {
     let list = books
     // A 'both' book carries the selected format too, so it matches either
@@ -517,6 +632,10 @@ export default function AuthorDetailPage() {
       // the selected format has no file yet, the aggregate still supplies
       // 'wanted' and the in-flight states (which have no per-format field).
       const statusOf = (b: Book): string => {
+        // With no type chip, any tracked file puts a wanted book in the library
+        // view as well (#3132). Only the Imported filter remaps it: the book
+        // stays in Wanted because a requested format is still missing.
+        if (!typeFilter && statusFilter === 'imported' && isPartiallyOwned(b)) return 'imported'
         if (!typeFilter || (b.mediaType || 'ebook') !== 'both') return b.status
         const path = typeFilter === 'ebook' ? b.ebookFilePath : b.audiobookFilePath
         return path ? 'imported' : b.status
@@ -540,15 +659,33 @@ export default function AuthorDetailPage() {
     } else if (publishedFilter === 'upcoming') {
       list = list.filter(b => !!b.releaseDate && b.releaseDate.slice(0, 10) > TODAY)
     }
-    if (dateSort !== 'none') {
+    if (monitoredFilter) {
+      list = list.filter(b => b.monitored === (monitoredFilter === 'monitored'))
+    }
+    if (activeLanguage) {
+      list = list.filter(b => canonicalLanguage(b.language) === activeLanguage)
+    }
+    if (sort === 'title-az' || sort === 'title-za') {
+      const dir = sort === 'title-az' ? 1 : -1
+      list = [...list].sort((a, b) =>
+        dir * (a.sortTitle || a.title).localeCompare(b.sortTitle || b.title, undefined, { numeric: true, sensitivity: 'base' }))
+    } else if (sort) {
+      const stamp = (b: Book) => {
+        const raw = sort === 'added-new' || sort === 'added-old' ? b.createdAt : b.releaseDate
+        const ms = raw ? new Date(raw).getTime() : NaN
+        return Number.isNaN(ms) ? null : ms
+      }
+      const dir = sort === 'date-old' || sort === 'added-old' ? 1 : -1
+      // Undated books go last in either direction rather than sorting as 1970.
       list = [...list].sort((a, b) => {
-        const da = a.releaseDate ? new Date(a.releaseDate).getTime() : 0
-        const db = b.releaseDate ? new Date(b.releaseDate).getTime() : 0
-        return dateSort === 'asc' ? da - db : db - da
+        const sa = stamp(a)
+        const sb = stamp(b)
+        if (sa === null || sb === null) return sa === sb ? 0 : sa === null ? 1 : -1
+        return dir * (sa - sb)
       })
     }
     return list
-  }, [books, typeFilter, statusFilter, publishedFilter, dateSort])
+  }, [books, typeFilter, statusFilter, publishedFilter, monitoredFilter, activeLanguage, sort])
 
   // Build the grouped-by-series sections from the author's series membership
   // joined against the filtered book set (#1125). Each section lists its books
@@ -615,15 +752,18 @@ export default function AuthorDetailPage() {
     : t('authorMetadataLink.actionFindBetter', 'Find better metadata')
   const counts = {
     total: books.length,
-    imported: books.filter(b => b.status === 'imported').length,
+    imported: books.filter(b => b.status === 'imported' || isPartiallyOwned(b)).length,
     wanted: searchableWantedCount,
     audiobook: books.filter(b => b.mediaType === 'audiobook').length,
   }
 
-  const toggleDateSort = () =>
-    setDateSort(prev => prev === 'none' ? 'asc' : prev === 'asc' ? 'desc' : 'none')
+  // Column-header sorting, mirroring BooksPage: first click ascending, a second
+  // click on the same column flips to descending.
+  const toggleSort = (asc: SortMode, desc: SortMode) =>
+    setSort(prev => prev === asc ? desc : asc)
 
-  const dateSortIcon = dateSort === 'asc' ? ' ↑' : dateSort === 'desc' ? ' ↓' : ''
+  const sortArrow = (asc: SortMode, desc: SortMode) =>
+    sort === asc ? ' ▲' : sort === desc ? ' ▼' : ''
 
   // This author's filtered books, in order — handed to BookDetailPage as
   // router state (#2548) for Previous/Next; see BookNavState there. #2548
@@ -676,13 +816,17 @@ export default function AuthorDetailPage() {
         }}
       >
         <td className="px-3 py-2 w-10 align-middle" onClick={e => e.stopPropagation()}>
-          <input
-            type="checkbox"
-            checked={selected.has(book.id)}
-            onChange={() => toggleSelect(book.id)}
-            className="rounded border-slate-400 dark:border-zinc-600 text-emerald-500 focus:ring-emerald-500 focus:ring-offset-0"
-            aria-label={`Select ${book.title}`}
-          />
+          {/* The label fills the cell, so the whole cell toggles the box: the
+              16px box alone is hard to tap. */}
+          <label className="flex items-center -mx-3 -my-2 px-3 py-2 cursor-pointer pointer-coarse:min-h-11">
+            <input
+              type="checkbox"
+              checked={selected.has(book.id)}
+              onChange={() => toggleSelect(book.id)}
+              className="rounded border-slate-400 dark:border-zinc-600 text-emerald-500 focus:ring-emerald-500 focus:ring-offset-0"
+              aria-label={`Select ${book.title}`}
+            />
+          </label>
         </td>
         <td className="px-3 py-2 align-middle">
           <Link
@@ -694,16 +838,16 @@ export default function AuthorDetailPage() {
               selectingClick(e, book)
             }}
           >
-            {book.imageUrl ? (
-              <img src={book.imageUrl} alt="" className="w-6 h-9 object-cover rounded flex-shrink-0" />
-            ) : (
-              <CoverPlaceholder
-                id={book.id}
-                title={book.title}
-                size="xs"
-                className="w-6 h-9 rounded flex-shrink-0"
-              />
-            )}
+            <CoverImage loading="lazy" decoding="async" src={book.imageUrl} alt="" className="w-6 h-9 object-cover rounded flex-shrink-0"
+              fallback={
+                <CoverPlaceholder
+                  id={book.id}
+                  title={book.title}
+                  size="xs"
+                  className="w-6 h-9 rounded flex-shrink-0"
+                />
+              }
+            />
             <span className="min-w-0 flex-1">
               <span className="block text-slate-800 dark:text-zinc-200 truncate">{book.title}</span>
               <span className="mt-1 flex flex-wrap items-center gap-1 sm:hidden">
@@ -731,6 +875,9 @@ export default function AuthorDetailPage() {
           </Link>
         </td>
         <td className="hidden sm:table-cell px-3 py-2 text-slate-600 dark:text-zinc-400 whitespace-nowrap align-middle">{fmtPublishedYear(book.releaseDate)}</td>
+        <td className="hidden md:table-cell px-3 py-2 text-slate-600 dark:text-zinc-400 whitespace-nowrap align-middle">
+          {book.averageRating && book.averageRating > 0 ? <BookRating book={book} /> : '—'}
+        </td>
         <td className="hidden sm:table-cell px-3 py-2 text-xs whitespace-nowrap align-middle">
           {mediaLabel(book.mediaType)}
         </td>
@@ -771,14 +918,21 @@ export default function AuthorDetailPage() {
                   />
                 )}
               </th>
-              <th className="w-full sm:w-[46%] text-left px-3 py-2 text-xs font-medium text-slate-600 dark:text-zinc-400 uppercase">Title</th>
+              <th
+                className="w-full sm:w-[46%] text-left px-3 py-2 text-xs font-medium text-slate-600 dark:text-zinc-400 uppercase cursor-pointer select-none hover:text-slate-900 dark:hover:text-white"
+                onClick={() => toggleSort('title-az', 'title-za')}
+                title="Sort by title"
+              >
+                Title{sortArrow('title-az', 'title-za')}
+              </th>
               <th
                 className="hidden sm:table-cell sm:w-28 text-left px-3 py-2 text-xs font-medium text-slate-600 dark:text-zinc-400 uppercase cursor-pointer select-none hover:text-slate-900 dark:hover:text-white whitespace-nowrap"
-                onClick={toggleDateSort}
+                onClick={() => toggleSort('date-old', 'date-new')}
                 title="Sort by publication date"
               >
-                Published{dateSortIcon}
+                Published{sortArrow('date-old', 'date-new')}
               </th>
+              <th className="hidden md:table-cell md:w-24 text-left px-3 py-2 text-xs font-medium text-slate-600 dark:text-zinc-400 uppercase">{t('books.colRating')}</th>
               <th className="hidden sm:table-cell sm:w-36 text-left px-3 py-2 text-xs font-medium text-slate-600 dark:text-zinc-400 uppercase">Type</th>
               <th className="hidden sm:table-cell sm:w-36 text-left px-3 py-2 text-xs font-medium text-slate-600 dark:text-zinc-400 uppercase">Status</th>
             </tr>
@@ -798,14 +952,20 @@ export default function AuthorDetailPage() {
           key={book.id}
           className={`relative border rounded-lg bg-slate-100 dark:bg-zinc-900 overflow-hidden group transition-colors ${selected.has(book.id) ? 'border-emerald-500' : 'border-slate-200 dark:border-zinc-800 hover:border-emerald-500'}`}
         >
-          <input
-            type="checkbox"
-            checked={selected.has(book.id)}
-            onChange={() => toggleSelect(book.id)}
+          {/* The label is the tap area: 32px round the box, 44px on a touch
+              screen, where the box sits further in to make room. */}
+          <label
+            className="absolute top-0 left-0 z-10 flex p-2 pointer-coarse:p-3.5 cursor-pointer"
             onClick={e => e.stopPropagation()}
-            className={`absolute top-2 left-2 z-10 rounded border-slate-400 dark:border-zinc-600 text-emerald-500 focus:ring-emerald-500 focus:ring-offset-0 ${selected.has(book.id) ? '' : 'bg-white/80 dark:bg-zinc-900/80'}`}
-            aria-label={`Select ${book.title}`}
-          />
+          >
+            <input
+              type="checkbox"
+              checked={selected.has(book.id)}
+              onChange={() => toggleSelect(book.id)}
+              className={`rounded border-slate-400 dark:border-zinc-600 text-emerald-500 focus:ring-emerald-500 focus:ring-offset-0 ${selected.has(book.id) ? '' : 'bg-white/80 dark:bg-zinc-900/80'}`}
+              aria-label={`Select ${book.title}`}
+            />
+          </label>
           <Link
             to={`/book/${book.id}`}
             state={bookNavState(book)}
@@ -813,11 +973,11 @@ export default function AuthorDetailPage() {
             onClick={e => { selectingClick(e, book) }}
           >
             <div className="aspect-[2/3] bg-slate-200 dark:bg-zinc-800 relative">
-              {book.imageUrl ? (
-                <img src={book.imageUrl} alt={book.title} className="w-full h-full object-cover" />
-              ) : (
-                <CoverPlaceholder id={book.id} title={book.title} size="sm" className="w-full h-full" />
-              )}
+              <CoverImage loading="lazy" decoding="async" src={book.imageUrl} alt={book.title} className="w-full h-full object-cover"
+                fallback={
+                  <CoverPlaceholder id={book.id} title={book.title} size="sm" className="w-full h-full" />
+                }
+              />
             </div>
             {/* Fixed height. The badge row and the year are both variable, so
                 cards in the same row used to end at different heights and the
@@ -848,7 +1008,10 @@ export default function AuthorDetailPage() {
               {/* No `book.releaseDate &&` guard: fmtPublishedYear already
                   returns an em dash for a missing date, so the conditional only
                   made the row appear and disappear between cards. */}
-              <p className="text-[10px] text-slate-600 dark:text-zinc-500 mt-auto">{fmtPublishedYear(book.releaseDate)}</p>
+              <p className="flex items-center justify-between gap-2 text-[10px] text-slate-600 dark:text-zinc-500 mt-auto">
+                <span>{fmtPublishedYear(book.releaseDate)}</span>
+                <BookRating book={book} />
+              </p>
             </div>
           </Link>
         </div>
@@ -899,16 +1062,16 @@ export default function AuthorDetailPage() {
 
       <div className="flex flex-col sm:flex-row gap-6 mb-8">
         <div className="w-32 flex-shrink-0">
-          {author.imageUrl ? (
-            <img src={author.imageUrl} alt={author.authorName} className="w-full rounded-full shadow-lg aspect-square object-cover" />
-          ) : (
-            <div className="aspect-square rounded-full bg-slate-200 dark:bg-zinc-800 flex items-center justify-center text-2xl font-bold text-slate-500 dark:text-zinc-600">
-              {author.authorName.charAt(0).toUpperCase()}
-            </div>
-          )}
+          <CoverImage src={author.imageUrl} alt={author.authorName} className="w-full rounded-full shadow-lg aspect-square object-cover"
+            fallback={
+              <div className="aspect-square rounded-full bg-slate-200 dark:bg-zinc-800 flex items-center justify-center text-2xl font-bold text-slate-500 dark:text-zinc-600">
+                {author.authorName.charAt(0).toUpperCase()}
+              </div>
+            }
+          />
         </div>
         <div className="min-w-0 flex-1">
-          <h2 className="text-2xl font-bold mb-1">{author.authorName}</h2>
+          <h2 className="text-2xl font-bold mb-1 [overflow-wrap:anywhere]">{author.authorName}</h2>
           {author.disambiguation && (
             <p className="text-xs text-slate-600 dark:text-zinc-500">{author.disambiguation}</p>
           )}
@@ -927,6 +1090,16 @@ export default function AuthorDetailPage() {
                 >
                   {t('common.viewOnSource', { source: src.label, defaultValue: 'View on {{source}} ↗' })}
                 </a>
+              ) : null
+            })()}
+            {/* BnF's Licence Ouverte asks for the source and the date
+                wherever its data is shown (#3144). */}
+            {(() => {
+              const date = authorProviderKey(author) === 'bnf' ? metadataRetrievedDate(author) : null
+              return date ? (
+                <span data-testid="bnf-source-credit">
+                  {t('common.bnfSourceCredit', { date, defaultValue: 'Data from the BnF, Licence Ouverte / Open Licence 2.0, retrieved {{date}}' })}
+                </span>
               ) : null
             })()}
           </div>
@@ -1167,7 +1340,7 @@ export default function AuthorDetailPage() {
           </>
         }
       >
-        {/* Three selects on one line, replacing three labelled chip groups
+        {/* Selects on one line, replacing three labelled chip groups
             totalling ten buttons plus an ml-auto "Select all" that wrapped to a
             second row and read as if it belonged to the Published group. The
             selects also expose `skipped`, which has been in StatusFilter all
@@ -1217,6 +1390,50 @@ export default function AuthorDetailPage() {
               </select>
             </label>
 
+            <label className="flex items-center gap-1.5 text-xs text-slate-600 dark:text-zinc-500">
+              {t('authorDetail.filters.monitored', 'Monitored')}
+              <select
+                value={monitoredFilter}
+                onChange={e => setMonitoredFilter(e.target.value as MonitoredFilter)}
+                className={selectCls}
+              >
+                <option value="">{t('authorDetail.filters.allMonitored', 'Any')}</option>
+                <option value="monitored">{t('authorDetail.filters.monitoredOnly', 'Monitored')}</option>
+                <option value="unmonitored">{t('authorDetail.filters.unmonitoredOnly', 'Unmonitored')}</option>
+              </select>
+            </label>
+
+            {languages.length > 1 && (
+              <label className="flex items-center gap-1.5 text-xs text-slate-600 dark:text-zinc-500">
+                {t('authorDetail.filters.language', 'Language')}
+                <select
+                  value={activeLanguage}
+                  onChange={e => setLanguageFilter(e.target.value)}
+                  className={selectCls}
+                >
+                  <option value="">{t('authorDetail.filters.allLanguages', 'All languages')}</option>
+                  {languages.map(l => <option key={l} value={l}>{languageName(l)}</option>)}
+                </select>
+              </label>
+            )}
+
+            <label className="flex items-center gap-1.5 text-xs text-slate-600 dark:text-zinc-500">
+              {t('authorDetail.filters.sort', 'Sort')}
+              <select
+                value={sort}
+                onChange={e => setSort(e.target.value as SortMode)}
+                className={selectCls}
+              >
+                <option value="">{t('authorDetail.filters.sortDefault', 'Default')}</option>
+                <option value="title-az">{t('authorDetail.filters.sortTitleAZ', 'Title A–Z')}</option>
+                <option value="title-za">{t('authorDetail.filters.sortTitleZA', 'Title Z–A')}</option>
+                <option value="date-new">{t('authorDetail.filters.sortNewest', 'Published, newest')}</option>
+                <option value="date-old">{t('authorDetail.filters.sortOldest', 'Published, oldest')}</option>
+                <option value="added-new">{t('authorDetail.filters.sortAddedNew', 'Added, newest')}</option>
+                <option value="added-old">{t('authorDetail.filters.sortAddedOld', 'Added, oldest')}</option>
+              </select>
+            </label>
+
             {/* Select/deselect every currently displayed book (#1172). Operates on
                 filteredBooks, so it respects the active filters and composes
                 with the per-book checkboxes used by the bulk action bar. */}
@@ -1232,8 +1449,16 @@ export default function AuthorDetailPage() {
           </div>
         )}
 
+        {syncing && (
+          <p role="status" className="mb-3 flex items-center gap-2 text-sm text-slate-600 dark:text-zinc-400">
+            <span aria-hidden="true" className="inline-block h-3.5 w-3.5 shrink-0 animate-spin rounded-full border-2 border-current border-t-transparent" />
+            {books.length === 0
+              ? t('authorDetail.syncing', 'Fetching this author’s catalogue. Books appear here when it finishes, which can take a few minutes for a large catalogue.')
+              : t('authorDetail.syncingMore', 'Fetching this author’s catalogue. Any new books appear here when it finishes.')}
+          </p>
+        )}
         {books.length === 0 ? (
-          <p className="text-sm text-slate-600 dark:text-zinc-500">No books tracked for this author yet.</p>
+          !syncing && <p className="text-sm text-slate-600 dark:text-zinc-500">No books tracked for this author yet.</p>
         ) : filteredBooks.length === 0 ? (
           <p className="text-sm text-slate-600 dark:text-zinc-500">No books match the current filters.</p>
         ) : groupBySeries ? (

@@ -22,15 +22,19 @@ OpenLibrary    Google Books, Hardcover.app,   Audnex, Audible
 ```
 
 Exactly one provider is *primary* — it defines what an author's catalogue is.
-`metadata.primary_provider` selects OpenLibrary (default), DNB, or Hardcover
-(token required); every provider that isn't primary is wired as an enricher.
+`metadata.primary_provider` selects OpenLibrary (default), DNB, Nasjonalbiblioteket
+(`nb`), the Bibliothèque nationale de France (`bnf`), or Hardcover (token required);
+every provider that isn't primary is wired as an enricher, except Nasjonalbiblioteket
+and BnF, which are wired only when primary. Switching the primary away from either
+therefore leaves its `nb:` or `bnf:` authors with no provider to sync from until
+they are relinked.
 
 ## Components
 
 | Layer | Stack | Notes |
 |-------|-------|-------|
 | **HTTP router** | [chi](https://github.com/go-chi/chi) v5 | Sub-routers per resource, middleware-driven auth/CSRF/rate-limit. |
-| **Backend language** | Go 1.26 (built with `golang:1.26.8-alpine`, the toolchain pinned in `go.mod`) | Standard library HTTP server, structured logging via `slog`. |
+| **Backend language** | Go 1.26 (built with `golang:1.26.9-alpine`, the toolchain pinned in `go.mod`) | Standard library HTTP server, structured logging via `slog`. |
 | **Database** | SQLite, WAL mode | [`modernc.org/sqlite`](https://pkg.go.dev/modernc.org/sqlite) — pure Go, no CGO. Single `bindery.db` file. Connection pragmas (`foreign_keys`, `busy_timeout`, `synchronous`, `temp_store`, `cache_size`) are carried in the DSN so the driver reapplies them to every connection it opens; see [Database durability](DEPLOYMENT.md#database-durability). |
 | **Schema migrations** | Embedded SQL files in `internal/db/migrations/` | Linearly-numbered, additive-only, applied at startup. |
 | **Frontend** | React 19 + TypeScript + Tailwind CSS 4 | Built with [Vite](https://vite.dev), output baked into the binary via `go:embed`. |
@@ -48,7 +52,7 @@ The `internal/` tree is organised by domain, not by layer:
 | `db` | Connection pooling, transaction helpers, repository interfaces, and the embedded schema migrations under `db/migrations/` (`NNN_description.sql`, applied idempotently at boot). |
 | `migrate` | Bulk-import of authors and related records from a `readarr.db` or a Goodreads CSV export. |
 | `models` | Domain types (Author, Book, Edition, Series, Indexer, etc.) shared across handlers, repos, and pipelines. |
-| `metadata` | OpenLibrary, Google Books, Hardcover, DNB, Audnex, Audible — fetchers and unifying interfaces. |
+| `metadata` | OpenLibrary, Google Books, Hardcover, DNB, Nasjonalbiblioteket, BnF, Audnex, Audible: fetchers and unifying interfaces. The HTTP providers share one request loop (`metadata/providerhttp`): a 429, 502, 503, 504 or transport error is retried up to 3 times, `Retry-After` is honoured up to 30 seconds with jittered backoff otherwise, and a refusal holds every request that client makes, failing one at once when the hold would outlast its deadline, reported as rate limited after a 429 and as unavailable after a 5xx. A Google Books daily quota refusal (`dailyLimitExceeded`, `quotaExceeded`) is not retried. The CSV, Readarr and Goodreads importers wait out a primary's hold and ask again (up to 3 times per lookup, and at most 10 minutes of waiting per run) instead of failing the row. A lookup still refused after that counts toward their primary outage breaker, so a primary that keeps refusing stops the import after 3 such lookups and the remaining rows fail with a "try again later" reason. The Add Book ISBN and ASIN lookups run under one 20 second deadline. BnF also paces itself at a fixed one request a second, two in flight, for the whole process, because BnF publishes no limit (`metadata/bnf/pacer.go`). Hardcover paces itself adaptively instead, and treats a 200 whose GraphQL errors report a rate limit as a refusal ([#2369](https://github.com/vavallee/bindery/issues/2369), [#2791](https://github.com/vavallee/bindery/issues/2791)). |
 | `indexer` | Newznab/Torznab clients, query builder, four-tier fallback, per-indexer query deduplication, result deduplication, ranking. |
 | `decision` | Quality profiles, language filter, custom formats, delay profiles, blocklist consultation. |
 | `downloader` | SABnzbd, NZBGet, qBittorrent, Transmission, Deluge, rTorrent clients (queue/history polling, submission, deletion). |
@@ -96,6 +100,7 @@ If audiobooks live on a different volume, set `BINDERY_AUDIOBOOK_DIR` (and optio
 - One HTTP server goroutine pool; chi's per-request handlers run on caller goroutines.
 - Background workers (auto-grab sweep, recommendations refresh, indexer probes, ABS import) are scheduled by the `scheduler` package as long-lived goroutines guarded by context cancellation on shutdown.
 - SQLite runs in WAL mode, but the connection pool is pinned to a single connection (`SetMaxOpenConns(1)`), so **reads serialize alongside writes** rather than running concurrently. WAL's concurrent-reader property is not currently being used. This is sufficient for the workload in practice, and [#2147](https://github.com/vavallee/bindery/issues/2147) tracks lifting it, including the reason it is not a one-line change: migrations run a connection-scoped `PRAGMA foreign_keys=OFF`, which a pool would break.
+- The persistent log (`logs` table) is written by one drain goroutine in batches: a batch is one transaction and closes at 100 records or 250 ms after its first record, whichever comes first. The single connection is not held while a batch fills. Records are never reordered, a full 512 slot channel still drops records rather than block the caller, and a graceful shutdown flushes the batch in hand. The tradeoff is that a hard crash can lose up to 250 ms of the most recent log lines from the table (stdout and the in-memory ring are unaffected). If a batch fails to commit its records are retried one at a time and the first failure of a run is reported once on stderr.
 - All outbound HTTP calls go through a shared client with timeouts, SSRF guards, and User-Agent stamping (`bindery/<version>`).
 
 ## Scheduled jobs
@@ -104,7 +109,7 @@ Registered by `internal/scheduler`. Every job runs under `SkipIfStillRunning`, s
 
 | Job | Interval | What it does |
 |-----|----------|--------------|
-| `check-downloads` | 15s | Polls download clients and imports finished jobs. |
+| `check-downloads` | 15s | Polls download clients and imports finished jobs. A job NZBGet or SABnzbd failed for its content (a failed repair or unpack, missing articles, a broken NZB) also blocklists the release, so the next search picks another. NZBGet's `FAILURE/UNPACK`, `FAILURE/PAR` and `FAILURE/SCAN` can also mean a fault on NZBGet's own machine, so for those the job log (`loadlog`) is read first, an evidence free `FAILURE/UNPACK` asks NZBGet 24's `sysinfo` for a missing UnRAR (lazily, cached six hours, never from the periodic probe; `HealthStore.NZBGetUnpackers`), and with no evidence a per client, per step breaker pauses blocklisting after three different releases fail the same step within two hours (`importer.contentFailureBreaker`, reported on the client's health); any other failure is retried after `models.DeadRegrabCooldown` ([#3024](https://github.com/vavallee/bindery/issues/3024)). |
 | `check-stalled` | 5m | Fails and re-searches downloads stuck past the stall timeout (`stall.timeout_minutes`, default 120). Stuck means either the client's own per torrent signal (qBittorrent stalledDL, a Transmission errorString, Deluge Error, an rTorrent message), which also blocklists the release, or a torrent the client accepted and never resolved the metadata for: no files, no size, no progress ([#2709](https://github.com/vavallee/bindery/issues/2709)). The second kind does **not** blocklist, because it is as much a property of the network as of the release and the blocklist has no expiry; its torrent is removed without deleting data (it has none), and its re-search skips that one release so it can pick another. It is also only applied past the timeout, because a healthy magnet looks the same while it resolves, and it is skipped entirely for a client where more than half the unfinished torrents look that way, which is a connectivity fault rather than a run of bad releases. |
 | `download-client-health` | 15m | Re-probes download client reachability and paths. |
 | `search-wanted` | `search.interval`, default 12h, read at startup | Searches indexers for wanted books and auto-grabs when enabled. |

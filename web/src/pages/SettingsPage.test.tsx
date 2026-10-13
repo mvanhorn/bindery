@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, within } from '@testing-library/react'
+import { BrowserRouter } from 'react-router'
 import SettingsPage from './SettingsPage'
 import { acceptConfirm } from '../test-utils'
 import { api, type ABSImportRun, type DownloadClient, type HardcoverList, type ImportList, type ImportListSyncProgress, type Indexer, type OidcProvider, type ProwlarrInstance, type RootFolder, type SystemStatus } from '../api/client'
@@ -283,7 +284,7 @@ function seedSettingsMocks(options: {
   vi.mocked(api.listProwlarr).mockResolvedValue(options.prowlarr ?? [])
   vi.mocked(api.addProwlarr).mockImplementation(async data => makeProwlarr({ id: 300, ...data }))
   vi.mocked(api.syncProwlarr).mockResolvedValue({ added: 0, updated: 0, removed: 0 })
-  vi.mocked(api.testProwlarr).mockResolvedValue({ ok: 'true', version: '1.0.0' })
+  vi.mocked(api.testProwlarr).mockResolvedValue({ ok: true, version: '1.0.0' })
   vi.mocked(api.deleteProwlarr).mockResolvedValue(undefined)
 
     vi.mocked(api.absConfig).mockResolvedValue({ featureEnabled: false, baseUrl: '', label: '', enabled: false, libraryId: '', libraryIds: [], pathRemap: '', apiKeyConfigured: false })
@@ -346,7 +347,9 @@ function seedSettingsMocks(options: {
 
 function renderSettings(options?: Parameters<typeof seedSettingsMocks>[0]) {
   if (options) seedSettingsMocks(options)
-  return render(<SettingsPage />)
+  // BrowserRouter reads window.location, so tests set the starting URL with
+  // history.replaceState and read ?tab= back from window.location.
+  return render(<BrowserRouter><SettingsPage /></BrowserRouter>)
 }
 
 async function openIndexersTab() {
@@ -400,7 +403,7 @@ function sectionForHeading(name: string) {
 describe('SettingsPage', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    // SettingsPage syncs the active tab into ?tab= via replaceState; reset it
+    // SettingsPage keeps the active tab in ?tab=; reset it
     // between tests so a tab selected in one test doesn't leak into the next
     // test's initial tab (jsdom shares one location across the file).
     window.history.replaceState(null, '', '/settings')
@@ -435,6 +438,22 @@ describe('SettingsPage', () => {
     // BlocklistTab renders its title; the General tab would not. (The t() mock
     // returns the key, so we assert on the key the blocklist tab emits.)
     expect(await screen.findByText('blocklist.title')).toBeInTheDocument()
+  })
+
+  it.each([true, false])('shows only an active Hardcover daily pause (%s)', async active => {
+    renderSettings({ status: { ...defaultStatus, hardcoverPausedUntil: new Date(Date.now() + (active ? 3600000 : -3600000)).toISOString() } })
+    await openApiKeysTab()
+    await screen.findByText('Hardcover API Token')
+    if (active) expect(await screen.findByText('settings.general.hardcoverPausedUntil')).toBeInTheDocument()
+    else expect(screen.queryByText('settings.general.hardcoverPausedUntil')).not.toBeInTheDocument()
+  })
+
+  it.each([true, false])('shows the rejected Hardcover token notice only when set (%s)', async rejected => {
+    renderSettings({ status: { ...defaultStatus, hardcoverTokenRejected: rejected } })
+    await openApiKeysTab()
+    await screen.findByText('Hardcover API Token')
+    if (rejected) expect(await screen.findByText('settings.general.hardcoverTokenRejected')).toBeInTheDocument()
+    else expect(screen.queryByText('settings.general.hardcoverTokenRejected')).not.toBeInTheDocument()
   })
 
   it('adds a write-only Hardcover token field with API link', async () => {

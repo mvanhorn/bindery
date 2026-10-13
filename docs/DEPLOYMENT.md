@@ -116,6 +116,13 @@ From the first release after v1.40.0, every archive and the checksums file also 
 gh attestation verify bindery_<version>_linux_amd64.tar.gz --repo vavallee/bindery
 ```
 
+From v1.40.1 the same attestation is also attached to the release as `bindery_<version>.intoto.jsonl` (a Sigstore bundle covering every archive and the checksums file), so you can verify against that file instead of fetching the attestation from GitHub's API:
+
+```bash
+gh attestation verify bindery_<version>_linux_amd64.tar.gz --repo vavallee/bindery \
+  --bundle bindery_<version>.intoto.jsonl
+```
+
 Each archive also has an SPDX SBOM (`<archive>.sbom.spdx.json`) beside it on the release.
 
 Each archive also carries `LICENSE` and `THIRD_PARTY_LICENSES.md` — the licenses
@@ -205,6 +212,18 @@ With that rule, `/downloads/.Completed/Some Book/book.epub` is read from `H:\Dow
 Every launch emits a `"starting bindery"` JSON log line containing the resolved `dbPath` and `dataDir`. If the binary can't write to them, `db.Open`'s preflight will name the directory and the required UID so you can fix the permission without guesswork.
 
 The frontend is embedded in the binary via `go:embed` — no separate static-file hosting needed.
+
+### File deletes stay inside your roots
+
+Deleting a book or an author with its files removes only files inside a root folder, `BINDERY_LIBRARY_DIR` or `BINDERY_AUDIOBOOK_DIR`, after resolving symlinks on both sides. A root that is itself a symlink to another volume works, but a symlink inside a root that points outside it is not followed. A path outside every root is skipped with a warning in the log (`path containment: refusing to delete file`) and the database row is still removed. With no root at all every file delete is refused until one is set; a default install cannot reach that state, because `BINDERY_LIBRARY_DIR` defaults to `/books`. A Calibre library that lives outside your roots is not covered by deletes from Bindery, as before.
+
+**Linked author folders.** If an author folder in your library is a symlink to another disk (`/books/Author -> /mnt/disk2/Author`), the file's real location is `/mnt/disk2/Author/...`, which is outside `/books`. Add the target (`/mnt/disk2` or the folder you link to) as an additional root folder (Settings, Root Folders), otherwise deleting a book from Bindery removes the row and leaves its files on disk, with the warning above in the log.
+
+## Caching and large downloads behind a reverse proxy
+
+The web app's build files under `/assets/` carry a content hash in their name, and Bindery serves them with `Cache-Control: public, max-age=31536000, immutable`. A proxy or CDN in front of Bindery may cache them for as long as it likes, because a new release changes the names. Nothing else is cached this way: `index.html` is `no-store`, and files such as the favicon and the manifest carry no cache headers, so clients fetch them again. If your proxy rewrites `Cache-Control` on `/assets/`, leave the long lifetime alone.
+
+Book downloads (`/api/v1/book/{id}/file` and the OPDS equivalent) are not bound by Bindery's 120 second response limit, so a large audiobook can take as long as the client needs. Bindery only drops a download when the client has stopped taking data for five minutes. Downloads honour `Range` requests, so a client can resume. An audiobook folder comes down as a zip that stores the audio, ebook and image files uncompressed, since they are compressed already. If a proxy sits in front, make sure its own read and send timeouts (`proxy_read_timeout` and `proxy_send_timeout` in nginx) are long enough for a slow link, and consider turning proxy response buffering off for that path.
 
 ## Running as a specific UID/GID
 
@@ -370,6 +389,12 @@ When Bindery and your download client run in **separate containers**, they typic
 
 Set a download-client path remap in **Settings → Download clients** or set the global `BINDERY_DOWNLOAD_PATH_REMAP` fallback to a comma-separated list of `from:to` pairs. Bindery applies a longest-prefix match to every path the download client reports, replacing the matched prefix before it tries to access the file. A per-client remap takes precedence when it matches the reported path; the global env var still applies as a fallback.
 
+The same remaps also run in reverse, with the same precedence, when Bindery tells a client where to save a grab. rTorrent always gets a download directory, and qBittorrent gets a save path when the client has no category set. That directory is Bindery's download folder (`BINDERY_DOWNLOAD_DIR`, or `BINDERY_AUDIOBOOK_DOWNLOAD_DIR` for audiobooks) translated into the client's path: by the client's own remap when it covers that folder, otherwise by `BINDERY_DOWNLOAD_PATH_REMAP`. With `BINDERY_DOWNLOAD_PATH_REMAP=/data:/downloads` and no client remap, rTorrent is told to save into `/data`. Bindery 1.40.0 and earlier applied only the client's own remap here, so with just the global remap set the client was sent Bindery's `/downloads`.
+
+The download client **Test** button and the 15 minute health check look at the folder a grab actually lands in, the same one **Diagnose** reports: for rTorrent, and for a qBittorrent client with no category, the folder it is sent, and for qBittorrent with a category the folder that category saves to. A qBittorrent category with an empty save path saves to the default save path plus the category name, and a relative one under the default save path. qBittorrent creates that folder on its first download, so until then the check is satisfied by its parent. Earlier releases checked rTorrent's own default directory and qBittorrent's default save path instead, so a working setup whose default folder Bindery cannot see was reported as broken ([#2664](https://github.com/vavallee/bindery/issues/2664)). Because Bindery sends rTorrent its own download folder, the check now confirms Bindery can read that folder, not that rTorrent writes to the same storage; if grabs never import, run **Diagnose** on the client.
+
+On the way out the global remap matches every client, because its right side is Bindery's own folder. If the global remap is written for one client (say SABnzbd sees Bindery's `/downloads` as `/data`) and an rTorrent or category-less qBittorrent mounts Bindery's folder at the same path, give that client an identity path remap, `/downloads:/downloads`. A client remap that covers the folder always wins, even when it maps it to itself, so that client keeps being sent `/downloads`. **Diagnose** on the client warns when the global remap produced the folder it sends while the client's own default save folder sits on Bindery's path, which is what that setup looks like. If the client really keeps that storage at the remapped path, ignore the warning.
+
 Per-client remaps are stored on each download client, so separate qBittorrent / SABnzbd / NZBGet instances can map different mount points. Existing download clients keep an empty remap after upgrade, which preserves the previous global-only behavior until you add a client-specific value.
 
 For a per-client remap, open **Settings → Download clients**, edit the client, and set **Download client path remap**. To see what a remap actually resolves to, press **Diagnose** on the client: it reports where that client says ebook and audiobook grabs land, which remap applies, and whether Bindery can read the result. The left side is the path the client reports; the right side is the path Bindery can read. For qBittorrent this normally means mapping the qBittorrent category save path or torrent content path to Bindery's download mount. Example: if qBittorrent reports `/downloads/books/My.Book` and Bindery sees that same folder as `/media/books/My.Book`, set `/downloads:/media/books`.
@@ -498,6 +523,7 @@ Several variables below have a database equivalent that overrides them once it i
 | `BINDERY_JOBS_DRAIN_GRACE` | `15` | Seconds to drain detached background jobs (ABS import, Grimmory sync, manual library scan, startup syncs) after the HTTP server has stopped and before the database is closed. These jobs are cancelled at drain start and given this window to wind down cleanly; any still running when it expires are logged and the process proceeds to shut down. Accepts a Go duration (e.g. `45s`, `2m`). This grace runs **after** `BINDERY_SHUTDOWN_GRACE`, so the two sum to the total shutdown budget: the defaults total 25s, under Kubernetes' default 30s `terminationGracePeriodSeconds`. If you raise either, raise `terminationGracePeriodSeconds` to match so drains finish before SIGKILL. The bundled Helm chart sets `terminationGracePeriodSeconds: 30` in its Deployment template with no values key, so raising the graces past 25s in total means patching that template. |
 | `BINDERY_ENFORCE_TENANCY` | _(off)_ | Set to `true`/`1` to enforce per-user data isolation: each user sees only their own authors and books (quality and metadata profiles and root folders stay shared and admin managed), and the join-scoped queue / history / pending / OPDS feeds are scoped to the requesting user. **Defaults off**, in which case every authenticated user shares one library view (single-user behaviour). Admin-only configuration gating applies regardless of this flag. Accepted truthy values are `1`, `true`, `yes` and `on`. When more than one user account exists and the gate is off, Bindery logs one warning at startup naming the variable, because those accounts share a single library view. See [multi-user.md](multi-user.md). |
 | `BINDERY_LOG_RETENTION_DAYS` | `14` | Days to retain persisted log entries in the SQLite log store before they are pruned. The same value is editable at **Settings → Logs → Log Retention**. |
+| `BINDERY_DOWNLOAD_RETENTION_DAYS` | `90` | Days to keep a finished download row before the scheduler deletes it. `0` keeps every row, which is how Bindery behaved before this setting existed. Only `imported` and `failed` rows are trimmed, counted from when they finished (the import time, or the moment of failure). Queued, downloading, importing, `importFailed`, `importBlocked`, `importExternal` and `importHeld` rows are never trimmed, nor is an `imported` or `failed` row while a newer row still names the same torrent or usenet job in a download client. History, the blocklist and your library are not touched. The job runs every 6 hours, the first pass six hours after startup, and deletes in small batches so it does not hold up requests. **What this changes:** `downloads.guid` is unique, and an imported row whose book still exists is what makes a grab of that same release answer "already imported". Once the row is trimmed that release can be grabbed again, which only comes up when the book becomes wanted again (for example you deleted its file) and the same release is the best match. Set `0` if you rely on that refusal for old imports. The first pass after an upgrade removes every row already past the window in one go, which on a long running install is most of the table, so set this to `0` in the environment before the first start of the new version if you want to keep them. The Queue page separately stops listing an `imported` row after 7 days (see `docs/API.md`), whatever this is set to. |
 | `BINDERY_TRUSTED_PROXY` | _(empty)_ | Comma-separated IP/CIDR list of reverse proxies trusted to set `X-Forwarded-*`. Used for two things: (1) resolving the real client IP (for local-only auth and the per-IP login rate-limiter) by walking the `X-Forwarded-For` chain and only trusting hops in this list — never a client-supplied leftmost entry; and (2) honouring `X-Forwarded-Proto` / `X-Forwarded-Host` for the public scheme/host, which drives the fully-qualified OPDS feed link URLs, the `BINDERY_COOKIE_SECURE=auto` decision, and the OIDC `redirect_uri`. Requests from any peer **not** in this list have all `X-Forwarded-*` stripped, so behind a TLS-terminating proxy (Traefik / Caddy / nginx) those links fall back to `http://` until the proxy's IP/CIDR is listed here — **set it even if you are not using proxy auth.** An entry like `0.0.0.0/0` trusts every peer and effectively disables per-IP decisions. **Required** when proxy auth mode is active — Bindery refuses to start without it. **It also matters for `local-only` auth mode:** local-only serves any client whose resolved IP is private, and with this list empty that decision falls back to the TCP peer. Behind a reverse proxy the peer is the proxy's own private address, so every proxied request qualifies as local. Set it whenever Bindery is reached through a proxy, or use `enabled` mode instead; Bindery logs a warning at startup and on a mode change when it sees local-only with this unset. |
 | `BINDERY_ALLOWED_HOSTS` | _(empty)_ | Only matters in `local-only` and `disabled` auth mode. Comma separated host names that may use those modes without a login, on top of the ones always accepted (IP addresses, `localhost` and `.localhost`, single label names, `.local`, `.lan`, `.home.arpa`, `.internal`, `.localdomain`, and the host of `BINDERY_OIDC_REDIRECT_BASE_URL`). `*.example.com` matches every name under a domain, needs at least two labels after `*.`, and must never be used for a shared domain such as `duckdns.org` or `ts.net`. A bare `*` switches the check off (DNS rebinding protection off, logged at startup). Set it when you open Bindery by a dotted name such as `books.example.com`, a Tailscale `*.ts.net` name, `nas.fritz.box` or a Kubernetes name like `bindery.media.svc`; otherwise that name gets the login page and `403` naming this variable. The name checked is the `Host` header Bindery receives, plus `X-Forwarded-Host` from a peer in `BINDERY_TRUSTED_PROXY`. Requests with an API key or a session are not checked. See [Host names in local-only and disabled mode](#host-names-in-local-only-and-disabled-mode). |
 | `BINDERY_TELEMETRY_DISABLED` | _(unset)_ | Set to `true` to opt out of the daily anonymous telemetry ping before any DB setting exists (e.g. on first boot). Equivalent to `telemetry.enabled: false` in **Settings → Logs**, but takes effect before the first ping fires. |
@@ -518,6 +544,10 @@ Outbound URLs are validated against an SSRF policy. Two trust levels apply:
 If a same-host service still isn't reachable, the usual cause is that the service is bound to an interface your URL doesn't match (for example SABnzbd listening only on `127.0.0.1` while you used the LAN IP, or vice versa). Either point Bindery at the interface the service actually listens on, or set the service to listen on `0.0.0.0`.
 
 **Outbound proxy interaction.** When `BINDERY_OUTBOUND_PROXY` is set, in-scope requests are dialled to the proxy and the proxy resolves the destination, so the destination-URL SSRF validation still runs up front. The per-connection dial re-check (the DNS-rebind guard) can then only see the proxy's own address, not the target's — so for the strict-policy cover-image proxy that re-check is skipped whenever a proxy is configured; otherwise it would reject a LAN/loopback proxy and block every cover fetch. Local destinations skip the proxy entirely per `BINDERY_OUTBOUND_PROXY_BYPASS_LOCAL` (see [Environment variables](#environment-variables)), which is also what keeps a LAN indexer manager (Jackett/Prowlarr) reachable.
+
+**Outbound proxy and direct connections (#1640).** The dial to the proxy itself is exempt from the per-connection re-check, so a LAN or loopback proxy keeps working. A destination that skips the proxy through `BINDERY_OUTBOUND_PROXY_BYPASS_LOCAL` or `BINDERY_OUTBOUND_PROXY_NO_PROXY` is dialled directly, and that direct connection is now checked against the same policy as it would be with no proxy configured; before #1640 it was not. If a destination you bypass is refused with `not allowed: points to ...`, it resolves to an address the policy for that feature blocks, for example loopback for a cover image or a webhook.
+
+**Download client and Audiobookshelf connections.** These are always direct, never through `BINDERY_OUTBOUND_PROXY`. Each connection, and each redirect a client answers with, is checked when it is made against the admin-typed service policy above: loopback, LAN and Docker hostnames work, link-local and cloud-metadata addresses are refused. A client saved on a `169.254.x.x` address fails its connection test with `points to link-local address`; reach it by another address.
 
 ### What goes in a download client's Host field
 
@@ -652,6 +682,21 @@ checks the live schema and restores that additive column automatically. Take a
 normal SQLite backup before upgrading; no manual SQL is required for this
 specific repair.
 
+### Duplicate key recompute (v1.42.0)
+
+The key Bindery stores in `books.dedup_key` to recognise the same book twice now
+folds a title filed with its article last (`Trace of Death, A` and `A Trace of
+Death`, #3122), so it is rewritten for every book once, on the first start after
+the upgrade. It runs during startup, before Bindery begins serving, and adds no schema
+migration; on a development machine 100,000 books took about 1.4 seconds. Rows that now share a key are neither merged nor removed: they
+show up together in **Review duplicates** for you to decide.
+
+### Startup work and background changes in v1.42.0
+
+- **Migration 107** adds four indexes (History by event type, pending releases per book, the newest-first downloads list and the quality profile in-use check). They are built once at startup, about half a second on a database with 200,000 history rows.
+- **Finished download rows are trimmed.** The first pass of the retention job runs about six hours after the first start of the new version and deletes every `imported` or `failed` row older than `BINDERY_DOWNLOAD_RETENTION_DAYS` (default 90) in batches. On a long running install that is most of the table. Set the variable to `0` before that first start to keep the rows. See the variable's row in the environment table.
+- **Log lines are written in batches** of up to 100 records or 250 ms. After a crash or power loss the newest 250 ms of log rows can be missing from Settings, Logs; a normal shutdown writes everything.
+
 ### Calibre library covers repair
 
 Versions before the #2564 fix stored each Calibre-imported book's cover as the library's absolute path in `editions.image_url`, which nothing could serve. On every start Bindery now runs a background pass over such rows: each readable `cover.jpg` is copied into `covers/` under `BINDERY_DATA_DIR` and the edition (and the book, when it has no provider cover) is repointed at the copy. No schema migration is involved. The Calibre library must be mounted at the path recorded in the rows for the pass to read the files; rows it cannot read are left untouched and retried on the next start, and a library import rewrites them as well. Progress is logged as `calibre cover repair finished` at `info`.
@@ -661,6 +706,105 @@ Versions before the #2564 fix stored each Calibre-imported book's cover as the l
 **Schema:** ABS import uses migrations `029` through `033`. They create five ABS tables: `abs_import_runs`, `abs_provenance`, `abs_metadata_conflicts`, `abs_import_run_entities`, and `abs_review_queue`. Migration `031` also adds `dry_run`, `source_config_json`, and `checkpoint_json` to `abs_import_runs`; migration `033` is currently a no-op compatibility migration. Take a normal SQLite backup before upgrading, then let Bindery apply the migrations on startup.
 
 **Outbound ABS requests:** ABS probes and imports send `User-Agent: bindery/<version>` to the configured ABS server. Development or unversioned builds use `bindery/dev`.
+
+### Metadata request caching
+
+Author and book searches through the metadata aggregator reuse successful
+provider responses for five minutes, including empty results. The search cache
+is limited to 1,000 entries per aggregator; expired entries and then the
+soonest-expiring entries are replaced as it fills. Search keys include the
+provider instance, operation, exact query (including search syntax/options),
+and any live credential scope. Ordinary searches, canonical matching, and
+cover enrichment share these provider responses without changing their ranking
+or matching rules.
+
+Concurrent identical search, author profile, book, or edition misses share one
+provider fetch. Hardcover throttling uses the remaining callers’ scheduling
+deadlines to avoid reserving slots none can use. Each caller can cancel
+independently; the upstream fetch is canceled when its last caller leaves. Failures are not cached as empty results, and returned values
+are copied so callers cannot modify another request's results. Book responses
+are cached before enrichment; enrichment snapshots also track live credential
+scopes and input metadata. After a search-provider failure a snapshot is kept
+for only five minutes, so the failing provider is retried once per window
+rather than on every lookup. Those short-lived snapshots share the 1,000-entry
+five-minute cache with search responses, so a large refresh during an enricher
+outage can evict recent searches early; they are refetched on next use.
+Cover-only providers retain their best-effort empty-result behavior. Raw and
+derived author catalogues also include provider scopes; a catalogue fetch uses
+one configuration snapshot across its primary, supplemental, and cover reads.
+
+Edition responses retain the existing 24-hour in-memory metadata cache and
+10,000-entry shared limit. After provider routing, `hc:dune` and an explicit
+Hardcover lookup of `dune` share an entry. Numeric-looking slugs, case-distinct
+slugs, and different providers remain distinct; Hardcover still tries the slug
+before its numeric-ID fallback. Live Hardcover token changes select a different
+cache namespace, and a fetch uses one token across all pages. Old namespaces
+expire under the same bounds. Changing the primary metadata provider or the
+Google Books key in Settings takes effect on the next lookup, with no restart
+(#1771); results that depend on more than one provider (ISBN lookups, author
+catalogues, enrichment, series search) are cached per provider set, so a
+switch never serves an answer the previous primary built. Direct provider calls remain uncached for callers
+that explicitly fetch fresh metadata, and a manual author **Refresh Metadata**
+still skips the cached author profile and catalogue (see
+`POST /api/v1/author/{id}/refresh` in [API.md](API.md)); its nested edition,
+cover and ISBN lookups keep using these caches.
+
+Caches are discarded on restart. Local edition rows can come from partial
+imports or embedded book metadata and have no complete-provider-snapshot
+freshness marker, so they are not used to satisfy these upstream lookups.
+Persistent edition caching would require tracking both completeness and
+provider/account freshness separately from local book refresh timestamps.
+These caches do not implement daily quota accounting or pause/resume.
+
+### Hardcover daily quota pause
+
+When Hardcover reports zero requests remaining in its daily `RateLimit` bucket,
+Bindery persists the reset time in private SQLite settings for that API token.
+Further calls using that token stop until the reset, including after a restart.
+Short per-minute throttling keeps its existing retry behavior; `Retry-After`
+alone is not treated as proof of daily exhaustion. Reset delays must be positive
+and no longer than 24 hours; invalid delays are ignored. The stored token
+fingerprints (HMAC-SHA256 under a random install-local key, also a private
+setting) and reset times are hidden from generic settings endpoints. If either
+stored value is corrupt, Bindery logs a warning and starts fresh instead of
+blocking every request.
+
+Settings → API Keys shows when the configured token can be used again. When
+Hardcover is the primary metadata provider, bulk metadata imports and
+background catalogue work stop on the daily hold rather than repeatedly asking
+an exhausted key; books a catalogue sync already created still finish their
+file matching, searches and summary. When Hardcover is only an enricher, bulk
+work carries on without it: held Hardcover calls fail immediately and ISBN
+lookups fall through to the other providers. A Hardcover list sync stops before
+fetching the list. Retry interrupted imports after the shown time; already
+committed records remain, and ABS keeps its checkpoint on the interrupted item.
+Scheduled jobs can run again on their next scheduled pass. This does not add
+automatic edition-hydration recovery or request accounting.
+Different tokens have separate holds, even if they belong to the same account.
+
+### Hardcover rejected token pause
+
+When Hardcover answers a request with a JSON 401 (a 401 page that is HTML or plain
+text came from a proxy or CDN and does not count), or with a 403 whose body is an
+authentication failure (`invalid_token`, `unauthorized`, `invalid_grant` or
+"Unable to verify token"), Bindery stops sending requests with that token. A
+bulk import, a discovery sweep, a catalogue sync, a list sync and the scheduled
+refresh stop at the first rejection instead of asking once per row, and the
+import result carries "Hardcover rejected the API token". Server errors (5xx),
+a 403 that only describes one query (`insufficient_scope`, `access_denied`,
+`invalid_request`) and GraphQL errors inside a 200 response do not start a pause.
+
+The pause is keyed to the token in the same way as the daily quota hold, so it
+survives a restart and saving a different token in **Settings → API Keys** lifts
+it at once. It also ends after one hour without a save: the next request is
+sent as a probe and either clears the hold (Hardcover accepted the token) or
+renews it. That is one request an hour for a token that stays bad. **Test
+connection** always sends its request, so a token fixed on Hardcover's side can
+be retested immediately, and a success lifts the pause. The pause applies to
+every Hardcover call, including when Hardcover is only an enricher, a cover or
+ISBN source or the list syncer. The hold is stored with the quota holds as a
+private setting and is hidden from generic settings endpoints; a corrupt row is
+logged and ignored.
 
 ### Enhanced Hardcover series data deployment note
 

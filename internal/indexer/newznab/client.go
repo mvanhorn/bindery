@@ -24,6 +24,7 @@ import (
 	"golang.org/x/text/unicode/norm"
 
 	"github.com/vavallee/bindery/internal/httpsec"
+	"github.com/vavallee/bindery/internal/textutil"
 	"github.com/vavallee/bindery/internal/useragent"
 )
 
@@ -235,14 +236,21 @@ func RedactDownloadURL(raw string) string {
 func detailURL(item rssItem) string {
 	download := item.Enclosure.URL
 
-	candidates := []string{item.Comments}
-	if strings.EqualFold(strings.TrimSpace(item.GUID.IsPermaLink), "true") {
-		candidates = append(candidates, item.GUID.Value)
+	// link marks the <link> fallback, which torznab feeds also use as a
+	// download link: with no enclosure it is the download URL, and next to a
+	// proxy enclosure it can be the tracker's direct passkey link.
+	type candidate struct {
+		raw  string
+		link bool
 	}
-	candidates = append(candidates, item.Link)
+	candidates := []candidate{{raw: item.Comments}}
+	if strings.EqualFold(strings.TrimSpace(item.GUID.IsPermaLink), "true") {
+		candidates = append(candidates, candidate{raw: item.GUID.Value})
+	}
+	candidates = append(candidates, candidate{raw: item.Link, link: true})
 
-	for _, raw := range candidates {
-		raw = strings.TrimSpace(raw)
+	for _, c := range candidates {
+		raw := strings.TrimSpace(c.raw)
 		if raw == "" || raw == download {
 			continue
 		}
@@ -256,12 +264,28 @@ func detailURL(item rssItem) string {
 		if u.Host == "" {
 			continue
 		}
-		// With no enclosure, <link> is the download URL itself, and a torznab
+		// <link> may be a download link (see candidate), and a torznab
 		// permalink is often a details page carrying the passkey. This is shown
-		// to every user, so it never carries a credential.
-		return RedactDownloadURL(raw)
+		// to every user, so it never carries a credential. A real detail page
+		// (<comments>) keeps its path, which people click and which is often a
+		// hex id; the <link> fallback, and a permalink that is also the GUID
+		// (shown redacted with the path rule), get the download URL treatment,
+		// path included.
+		if c.link || raw == strings.TrimSpace(item.GUID.Value) {
+			return RedactDownloadURL(raw)
+		}
+		return RedactInfoURL(raw)
 	}
 	return ""
+}
+
+// RedactInfoURL removes credentials from a detail page link before it is
+// shown: secret parameters and user:pass@ come off, the path stays, since it
+// is the indexer's id for the release and people click the link (see
+// httpsec.StripDetailURLSecrets). Use RedactDownloadURL for an info link that
+// is the download link itself.
+func RedactInfoURL(raw string) string {
+	return httpsec.StripDetailURLSecrets(raw)
 }
 
 // Caps fetches the indexer capabilities.
@@ -329,6 +353,15 @@ func (c *Client) Search(ctx context.Context, query string, categories []int) ([]
 // gated on inequality, so titles without umlauts (the common case, and every
 // non-Latin script) never issue a second pass — the cost is one extra cascade
 // only for German titles that the ASCII form failed to find.
+//
+// Some trackers store a release title decomposed (NFD: "a" + U+030A instead of
+// "å") and match query bytes literally, so every composed query misses it while
+// the author alone finds it. When nothing has been found yet and the
+// decomposed spelling differs, the cascade runs once more with it. A title
+// with no decomposable letter (ASCII, "ø", "æ", Chinese, most Cyrillic) never
+// pays for that pass. Hangul, kana with dakuten or handakuten, and Cyrillic
+// "й" all decompose, so titles in those scripts do pay for it when the first
+// passes find nothing.
 func (c *Client) BookSearch(ctx context.Context, title, author string, categories []int) ([]SearchResult, error) {
 	origTitle := primaryTitleForQuery(title)
 	origAuthor := norm.NFC.String(author)
@@ -351,7 +384,15 @@ func (c *Client) BookSearch(ctx context.Context, title, author string, categorie
 	if len(results) == 0 && (queryTitle != origTitle || queryAuthor != origAuthor) {
 		slog.Debug("indexer book search retry with original umlaut spelling",
 			"title", origTitle, "author", origAuthor)
-		return c.bookSearchTiers(ctx, origTitle, origAuthor, categories)
+		if results, err = c.bookSearchTiers(ctx, origTitle, origAuthor, categories); err != nil {
+			return nil, err
+		}
+	}
+	nfdTitle, nfdAuthor := norm.NFD.String(origTitle), norm.NFD.String(origAuthor)
+	if len(results) == 0 && (nfdTitle != origTitle || nfdAuthor != origAuthor) {
+		slog.Debug("indexer book search retry with decomposed (NFD) spelling",
+			"title", origTitle, "author", origAuthor)
+		return c.bookSearchTiers(ctx, nfdTitle, nfdAuthor, categories)
 	}
 	return results, nil
 }
@@ -705,6 +746,11 @@ func wordsPresentInAll(words, combined []string) bool {
 		if IsVolumeMarker(w) {
 			w = "vol"
 		}
+		// The haystacks are in the release alphabet, where an umlaut is
+		// already its digraph. SigWords keeps the umlaut on the keyword (see
+		// SigWords), so expand it here or "müller" is never found in
+		// "mueller". Plain Contains, so no compact-spelling flex, as before.
+		w = textutil.TransliterateUmlauts(w)
 		found := false
 		for _, c := range combined {
 			if strings.Contains(c, w) {
@@ -912,9 +958,10 @@ func (c *Client) getXMLCached(ctx context.Context, rawURL string, target interfa
 // error. The caller unmarshals.
 func (c *Client) fetchXML(ctx context.Context, rawURL string) ([]byte, error) {
 	// The daily query cap is enforced here rather than at the top of the
-	// searcher's fan-out because one BookSearch can issue up to eight requests
-	// as it falls through the tier cascade and the transliteration retry. A
-	// check made once per search could therefore overshoot the cap by seven;
+	// searcher's fan-out because one BookSearch can issue up to twelve requests
+	// as it falls through the tier cascade, the transliteration retry and the
+	// decomposed (NFD) retry. A check made once per search could therefore
+	// overshoot the cap by eleven;
 	// checked here it cannot overshoot at all. Requests served from the query
 	// cache never reach this function and correctly cost nothing (#2312).
 	if b := budgetFrom(ctx); b != nil && !b.Take() {

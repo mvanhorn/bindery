@@ -51,6 +51,7 @@ type searchDoc struct {
 	NumberOfPages    *int     `json:"number_of_pages_median"`
 	Publisher        []string `json:"publisher"`
 	Subject          []string `json:"subject"`
+	RatingsAvg       float64  `json:"ratings_average"`
 	RatingsCount     int      `json:"ratings_count"`
 }
 
@@ -100,6 +101,11 @@ type workResponse struct {
 	Subjects    []string        `json:"subjects"`
 	Authors     []workAuthor    `json:"authors"`
 	Series      flexStringSlice `json:"series"`
+	// CoverEdition points at the edition OpenLibrary's own work page
+	// features, "/books/OL123M" (#1779).
+	CoverEdition *struct {
+		Key string `json:"key"`
+	} `json:"cover_edition"`
 }
 
 type workAuthor struct {

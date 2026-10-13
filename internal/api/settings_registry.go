@@ -151,10 +151,9 @@ var settingDescriptors = []SettingDescriptor{
 	},
 	{
 		Key: SettingMetadataPrimaryProvider, Type: SettingTypeEnum, Default: "openlibrary",
-		Values:          MetadataPrimaryProviders,
-		Description:     "Provider that decides what an author catalogue looks like. The others stay wired as enrichers. Selecting hardcover requires a stored Hardcover API token.",
-		RestartRequired: true,
-		State:           SettingStateActive,
+		Values:      MetadataPrimaryProviders,
+		Description: "Provider that decides what an author catalogue looks like. The others stay wired as enrichers. Selecting hardcover requires a stored Hardcover API token. A change applies to the next metadata lookup, without a restart.",
+		State:       SettingStateActive,
 	},
 	{
 		Key: "search.preferredLanguage", Type: SettingTypeString, Default: "",
@@ -347,6 +346,31 @@ var settingDescriptors = []SettingDescriptor{
 		State:       SettingStateActive,
 	},
 	{
+		Key: "backfill.asin_case_rev", Type: SettingTypeInt, Default: "0",
+		Description: "Revision of the ASIN case fold normalizer the startup backfill last ran at (isbnutil.NormalizeASINRev). Bindery compares it with the current revision at every start and re-runs the backfill only when they differ. Removing the row is harmless but makes the next start repeat the backfill once.",
+		State:       SettingStateInternal,
+	},
+	{
+		Key: "backfill.book_sort_key_rev", Type: SettingTypeInt, Default: "0",
+		Description: "Revision of the book sort key normalizer the startup backfill last ran at (the book sort key normalizer). Bindery compares it with the current revision at every start and re-runs the backfill only when they differ. Removing the row is harmless but makes the next start repeat the backfill once.",
+		State:       SettingStateInternal,
+	},
+	{
+		Key: "backfill.dedup_key_rev", Type: SettingTypeInt, Default: "0",
+		Description: "Revision of the book dedup key normalizer the startup backfill last ran at (CanonicalDedupKeyRev). Bindery compares it with the current revision at every start and re-runs the backfill only when they differ. Removing the row is harmless but makes the next start repeat the backfill once.",
+		State:       SettingStateInternal,
+	},
+	{
+		Key: "backfill.search_key_rev", Type: SettingTypeInt, Default: "0",
+		Description: "Revision of the search key normalizer the startup backfill last ran at (the search key normalizer). Bindery compares it with the current revision at every start and re-runs the backfill only when they differ. Removing the row is harmless but makes the next start repeat the backfill once.",
+		State:       SettingStateInternal,
+	},
+	{
+		Key: "backfill.sort_key_rev", Type: SettingTypeInt, Default: "0",
+		Description: "Revision of the author sort key normalizer the startup backfill last ran at (the author sort key normalizer). Bindery compares it with the current revision at every start and re-runs the backfill only when they differ. Removing the row is harmless but makes the next start repeat the backfill once.",
+		State:       SettingStateInternal,
+	},
+	{
 		Key: "calibre.last_import_at", Type: SettingTypeString, Default: "",
 		Description: "RFC3339 timestamp of the last Calibre library import, written by the importer and shown on the Calibre settings tab.",
 		State:       SettingStateInternal,
@@ -484,15 +508,13 @@ var settingDescriptors = []SettingDescriptor{
 	// Google Books.
 	{
 		Key: SettingGoogleBooksAPIKey, Type: SettingTypeString, Default: "",
-		Description:     "Google Books API key, used to enrich metadata. The enricher is wired at startup, so a newly added key does nothing until Bindery restarts.",
-		RestartRequired: true,
-		State:           SettingStateActive,
+		Description: "Google Books API key, used to enrich metadata. Saving a key adds the Google Books enricher straight away, without a restart; with no key Google Books is not asked at all.",
+		State:       SettingStateActive,
 	},
 	{
 		Key: LegacySettingGoogleBooksAPIKey, Type: SettingTypeString, Default: "",
-		Description:     "Original spelling of googlebooks.apiKey, still read as a fallback for installs that stored the key under it.",
-		RestartRequired: true,
-		State:           SettingStateActive,
+		Description: "Original spelling of googlebooks.apiKey, still read as a fallback for installs that stored the key under it.",
+		State:       SettingStateActive,
 	},
 
 	// Auth. Every key here is classified secret, so the generic settings API

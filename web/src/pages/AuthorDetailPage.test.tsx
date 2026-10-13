@@ -1,6 +1,6 @@
 import { useEffect } from 'react'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { act, render, screen, fireEvent, waitFor, within } from '@testing-library/react'
+import { act, cleanup, render, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router'
 import AuthorDetailPage from './AuthorDetailPage'
 import { api, ApiError } from '../api/client'
@@ -307,6 +307,28 @@ describe('AuthorDetailPage', () => {
     expect(api.searchAuthorWanted).not.toHaveBeenCalled()
   })
 
+  // #3144: BnF's Licence Ouverte asks for the source and the date.
+  it('credits the BnF with the date of the last metadata refresh for a BnF author', async () => {
+    renderAuthorDetailPage([], 'grid', {
+      foreignAuthorId: 'bnf:author:11885918',
+      authorName: 'Lewis Carroll',
+      sortName: 'Carroll, Lewis',
+      metadataProvider: 'bnf',
+      createdAt: '2026-10-01T08:00:00Z',
+      lastMetadataRefreshAt: '2026-10-10T07:00:00Z',
+    })
+
+    const credit = await screen.findByTestId('bnf-source-credit')
+    expect(credit.textContent).toContain('BnF')
+    expect(credit.textContent).toContain('2026-10-10')
+  })
+
+  it('shows no BnF credit for an author from another provider', async () => {
+    renderAuthorDetailPage([], 'grid', { createdAt: '2026-10-01T08:00:00Z' })
+    await screen.findByRole('heading', { level: 2 })
+    expect(screen.queryByTestId('bnf-source-credit')).toBeNull()
+  })
+
   it('shows link metadata for unlinked authors', async () => {
     renderAuthorDetailPage([], 'grid', {
       foreignAuthorId: 'abs:author:library:emilia-jae',
@@ -517,10 +539,10 @@ describe('AuthorDetailPage', () => {
     expect(within(table).getByRole('columnheader', { name: 'Status' })).toBeInTheDocument()
 
     // Cells: [0]=row checkbox (bulk select), [1]=title+inline metadata,
-    // [2]=published year, [3]=type, [4]=status. Checkbox column was added
-    // for #791 bulk multi-select.
+    // [2]=published year, [3]=rating, [4]=type, [5]=status. Checkbox column
+    // was added for #791 bulk multi-select.
     const firefightCells = within(rowForTitle('Firefight')).getAllByRole('cell')
-    expect(firefightCells).toHaveLength(5)
+    expect(firefightCells).toHaveLength(6)
     expect(within(firefightCells[0]).getByRole('checkbox')).toBeInTheDocument()
     expect(firefightCells[1]).toHaveTextContent('Wanted')
     expect(firefightCells[1]).toHaveTextContent('📖 Ebook')
@@ -528,16 +550,16 @@ describe('AuthorDetailPage', () => {
     expect(firefightCells[1]).not.toHaveTextContent('2008-01-01')
     expect(firefightCells[2]).toHaveTextContent('2008')
     expect(firefightCells[2]).not.toHaveTextContent('2008-01-01')
-    expect(firefightCells[3]).toHaveTextContent('📖 Ebook')
-    expect(firefightCells[4]).toHaveTextContent('Wanted')
+    expect(firefightCells[4]).toHaveTextContent('📖 Ebook')
+    expect(firefightCells[5]).toHaveTextContent('Wanted')
 
     const snapshotCells = within(rowForTitle('Snapshot')).getAllByRole('cell')
     expect(snapshotCells[1]).toHaveTextContent('Skipped')
     expect(snapshotCells[1]).toHaveTextContent('🎧 Audiobook')
     expect(snapshotCells[1]).toHaveTextContent('2023')
     expect(snapshotCells[2]).toHaveTextContent('2023')
-    expect(snapshotCells[3]).toHaveTextContent('🎧 Audiobook')
-    expect(snapshotCells[4]).toHaveTextContent('Skipped')
+    expect(snapshotCells[4]).toHaveTextContent('🎧 Audiobook')
+    expect(snapshotCells[5]).toHaveTextContent('Skipped')
 
     const dualFormatCells = within(rowForTitle('Dual Format')).getAllByRole('cell')
     expect(dualFormatCells[1]).toHaveTextContent('Imported')
@@ -545,9 +567,9 @@ describe('AuthorDetailPage', () => {
     expect(dualFormatCells[1]).toHaveTextContent('2022')
     expect(dualFormatCells[1]).toHaveTextContent('Excluded')
     expect(dualFormatCells[2]).toHaveTextContent('2022')
-    expect(dualFormatCells[3]).toHaveTextContent('📖🎧 Both')
-    expect(dualFormatCells[4]).toHaveTextContent('Imported')
-    expect(dualFormatCells[4]).toHaveTextContent('Excluded')
+    expect(dualFormatCells[4]).toHaveTextContent('📖🎧 Both')
+    expect(dualFormatCells[5]).toHaveTextContent('Imported')
+    expect(dualFormatCells[5]).toHaveTextContent('Excluded')
   })
 
   it('bulk-excludes selected books via /book/bulk', async () => {
@@ -681,6 +703,39 @@ describe('AuthorDetailPage', () => {
     fireEvent.change(screen.getByLabelText('Type'), { target: { value: 'audiobook' } })
     expect(screen.getByText('Dual Ebook Done')).toBeInTheDocument()
     expect(screen.queryByText('Plain Ebook Wanted')).not.toBeInTheDocument()
+  })
+
+  it('lists a partially owned dual-format book under Imported and counts it in library (#3132)', async () => {
+    renderAuthorDetailPage(
+      [
+        makeBook({
+          id: 621, title: 'Partly Owned', status: 'wanted', monitored: true,
+          mediaType: 'both', ebookFilePath: '/books/loop.epub', audiobookFilePath: '',
+        }),
+        makeBook({ id: 622, title: 'Nothing Owned', status: 'wanted', monitored: true, mediaType: 'both' }),
+      ],
+      'table',
+    )
+    await screen.findByText('Partly Owned')
+    const stats = await screen.findByTestId('author-stats')
+    expect(within(stats).getByText('In library').parentElement).toHaveTextContent('1')
+
+    fireEvent.change(screen.getByLabelText('Status'), { target: { value: 'imported' } })
+    expect(screen.getByText('Partly Owned')).toBeInTheDocument()
+    expect(screen.queryByText('Nothing Owned')).not.toBeInTheDocument()
+
+    // Still wanted too: one format is missing.
+    fireEvent.change(screen.getByLabelText('Status'), { target: { value: 'wanted' } })
+    expect(screen.getByText('Partly Owned')).toBeInTheDocument()
+    expect(screen.getByText('Nothing Owned')).toBeInTheDocument()
+
+    // With a format chip the file has to be of that format: the ebook only
+    // book is not in the audiobook library, matching the Books page.
+    fireEvent.change(screen.getByLabelText('Status'), { target: { value: 'imported' } })
+    fireEvent.change(screen.getByLabelText('Type'), { target: { value: 'audiobook' } })
+    expect(screen.queryByText('Partly Owned')).not.toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('Type'), { target: { value: 'ebook' } })
+    expect(screen.getByText('Partly Owned')).toBeInTheDocument()
   })
 
   it("includes 'both' books under either media-type chip (#1406)", async () => {
@@ -846,6 +901,133 @@ describe('AuthorDetailPage — toolbar and stats', () => {
 
     renderAuthorDetailPage([makeBook({ id: 1, title: 'A', status: 'imported' })])
     expect(await screen.findByLabelText('Status')).toHaveValue('skipped')
+  })
+
+  // Grid headings in document order — the order the user sees.
+  const shownTitles = (titles: string[]) =>
+    screen.getAllByRole('heading')
+      .map(h => h.textContent ?? '')
+      .filter(txt => titles.includes(txt))
+
+  it('sorts by title, publication date and date added from the Sort select', async () => {
+    renderAuthorDetailPage([
+      makeBook({ id: 1, title: 'Beta', status: 'imported', releaseDate: '2010-01-01T00:00:00Z', createdAt: '2024-03-01T00:00:00Z' }),
+      makeBook({ id: 2, title: 'Gamma', status: 'imported', releaseDate: '2020-01-01T00:00:00Z', createdAt: '2024-01-01T00:00:00Z' }),
+      makeBook({ id: 3, title: 'Alpha', status: 'imported', releaseDate: '2015-01-01T00:00:00Z', createdAt: '2024-02-01T00:00:00Z' }),
+    ])
+    const all = ['Alpha', 'Beta', 'Gamma']
+    await screen.findByRole('heading', { name: 'Beta' })
+    expect(shownTitles(all)).toEqual(['Beta', 'Gamma', 'Alpha'])
+
+    const sort = screen.getByLabelText('Sort')
+    fireEvent.change(sort, { target: { value: 'title-az' } })
+    expect(shownTitles(all)).toEqual(['Alpha', 'Beta', 'Gamma'])
+    fireEvent.change(sort, { target: { value: 'title-za' } })
+    expect(shownTitles(all)).toEqual(['Gamma', 'Beta', 'Alpha'])
+    fireEvent.change(sort, { target: { value: 'date-new' } })
+    expect(shownTitles(all)).toEqual(['Gamma', 'Alpha', 'Beta'])
+    fireEvent.change(sort, { target: { value: 'date-old' } })
+    expect(shownTitles(all)).toEqual(['Beta', 'Alpha', 'Gamma'])
+    fireEvent.change(sort, { target: { value: 'added-new' } })
+    expect(shownTitles(all)).toEqual(['Beta', 'Alpha', 'Gamma'])
+    fireEvent.change(sort, { target: { value: 'added-old' } })
+    expect(shownTitles(all)).toEqual(['Gamma', 'Alpha', 'Beta'])
+  })
+
+  it('sorts undated books last in both date directions', async () => {
+    renderAuthorDetailPage([
+      makeBook({ id: 1, title: 'Undated', status: 'imported' }),
+      makeBook({ id: 2, title: 'Old', status: 'imported', releaseDate: '2001-01-01T00:00:00Z' }),
+      makeBook({ id: 3, title: 'New', status: 'imported', releaseDate: '2021-01-01T00:00:00Z' }),
+    ])
+    const all = ['Undated', 'Old', 'New']
+    await screen.findByRole('heading', { name: 'Undated' })
+    fireEvent.change(screen.getByLabelText('Sort'), { target: { value: 'date-old' } })
+    expect(shownTitles(all)).toEqual(['Old', 'New', 'Undated'])
+    fireEvent.change(screen.getByLabelText('Sort'), { target: { value: 'date-new' } })
+    expect(shownTitles(all)).toEqual(['New', 'Old', 'Undated'])
+  })
+
+  it('persists the sort and migrates the old Published-header setting', async () => {
+    localStorage.setItem('bindery.sort.author-detail.date', 'desc')
+    const { unmount } = renderAuthorDetailPage([makeBook({ id: 1, title: 'A', status: 'imported' })])
+    expect(await screen.findByLabelText('Sort')).toHaveValue('date-new')
+    fireEvent.change(screen.getByLabelText('Sort'), { target: { value: 'title-za' } })
+    unmount()
+
+    renderAuthorDetailPage([makeBook({ id: 1, title: 'A', status: 'imported' })])
+    expect(await screen.findByLabelText('Sort')).toHaveValue('title-za')
+  })
+
+  it('sorts from the Title and Published column headers in table view', async () => {
+    renderAuthorDetailPage([
+      makeBook({ id: 1, title: 'Beta', status: 'imported', releaseDate: '2010-01-01T00:00:00Z' }),
+      makeBook({ id: 2, title: 'Alpha', status: 'imported', releaseDate: '2020-01-01T00:00:00Z' }),
+    ], 'table')
+    await screen.findByText('Beta')
+    fireEvent.click(screen.getByRole('columnheader', { name: /Title/ }))
+    expect(screen.getByLabelText('Sort')).toHaveValue('title-az')
+    fireEvent.click(screen.getByRole('columnheader', { name: /Title/ }))
+    expect(screen.getByLabelText('Sort')).toHaveValue('title-za')
+    fireEvent.click(screen.getByRole('columnheader', { name: /Published/ }))
+    expect(screen.getByLabelText('Sort')).toHaveValue('date-old')
+  })
+
+  it('filters by monitored state', async () => {
+    renderAuthorDetailPage([
+      makeBook({ id: 1, title: 'Watched', status: 'wanted', monitored: true }),
+      makeBook({ id: 2, title: 'Ignored', status: 'wanted', monitored: false }),
+    ])
+    await screen.findByRole('heading', { name: 'Watched' })
+    fireEvent.change(screen.getByLabelText('Monitored'), { target: { value: 'unmonitored' } })
+    expect(screen.queryByRole('heading', { name: 'Watched' })).toBeNull()
+    expect(screen.getByRole('heading', { name: 'Ignored' })).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('Monitored'), { target: { value: 'monitored' } })
+    expect(screen.getByRole('heading', { name: 'Watched' })).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Ignored' })).toBeNull()
+  })
+
+  it('offers a Language filter only when the books span more than one', async () => {
+    const { unmount } = renderAuthorDetailPage([
+      makeBook({ id: 1, title: 'English One', status: 'imported', language: 'eng' }),
+      makeBook({ id: 2, title: 'English Two', status: 'imported', language: 'eng' }),
+    ])
+    await screen.findByRole('heading', { name: 'English One' })
+    expect(screen.queryByLabelText('Language')).toBeNull()
+    unmount()
+
+    renderAuthorDetailPage([
+      makeBook({ id: 1, title: 'English One', status: 'imported', language: 'eng' }),
+      makeBook({ id: 2, title: 'Deutsch Eins', status: 'imported', language: 'ger' }),
+    ])
+    await screen.findByRole('heading', { name: 'English One' })
+    fireEvent.change(screen.getByLabelText('Language'), { target: { value: 'ger' } })
+    expect(screen.queryByRole('heading', { name: 'English One' })).toBeNull()
+    expect(screen.getByRole('heading', { name: 'Deutsch Eins' })).toBeInTheDocument()
+  })
+
+  it('treats "en" and "eng" as one language in the Language filter', async () => {
+    const { unmount } = renderAuthorDetailPage([
+      makeBook({ id: 1, title: 'Two Letter', status: 'imported', language: 'en' }),
+      makeBook({ id: 2, title: 'Three Letter', status: 'imported', language: 'eng' }),
+    ])
+    await screen.findByRole('heading', { name: 'Two Letter' })
+    // Both spellings are English, so there is nothing to choose between.
+    expect(screen.queryByLabelText('Language')).toBeNull()
+    unmount()
+
+    renderAuthorDetailPage([
+      makeBook({ id: 1, title: 'Two Letter', status: 'imported', language: 'en' }),
+      makeBook({ id: 2, title: 'Three Letter', status: 'imported', language: 'eng' }),
+      makeBook({ id: 3, title: 'Deutsch', status: 'imported', language: 'de' }),
+    ])
+    await screen.findByRole('heading', { name: 'Two Letter' })
+    const select = screen.getByLabelText('Language')
+    expect(within(select).getAllByRole('option').map(o => o.textContent)).toEqual(['All languages', 'English', 'German'])
+    fireEvent.change(select, { target: { value: 'eng' } })
+    expect(screen.getByRole('heading', { name: 'Two Letter' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Three Letter' })).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Deutsch' })).toBeNull()
   })
 
   it('keeps all four stat cells when a count is zero', async () => {
@@ -1195,12 +1377,38 @@ describe('AuthorDetailPage: manual refresh', () => {
     expect(vi.mocked(api.getAuthor).mock.calls.length).toBe(calls)
   })
 
-  it('gives up waiting after a minute and shows whatever the server has', async () => {
+  it('regroups by series after a refresh moves a book into one (#2554)', async () => {
+    // Grouped by series: before the refresh the book is in none, the refresh
+    // files it under one, and the page must regroup without a reload.
+    localStorage.setItem('bindery.group.author-detail.series', 'true')
+    const book = makeBook({ id: 7, title: 'Fjellvinden', status: 'imported' })
+    renderAuthorDetailPage([book], 'table')
+    await screen.findByRole('heading', { name: /Standalone/ })
+
+    vi.useFakeTimers()
+    const finishAt = Date.now() + 3000
+    const synced = () => Date.now() >= finishAt
+    vi.mocked(api.getAuthor).mockImplementation(async () => (synced() ? author : { ...author, syncInProgress: true }))
+    vi.mocked(api.listAuthorSeries).mockImplementation(async () => (synced()
+      ? [{ id: 3, foreignSeriesId: 's:3', title: 'Fjellserien', description: '', monitored: false, books: [{ seriesId: 3, bookId: 7, positionInSeries: '1' }] }]
+      : []))
+    vi.mocked(api.refreshAuthor).mockResolvedValue(undefined)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+    await advance(4000)
+    expect(screen.getByRole('heading', { name: /Fjellserien/ })).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: /Standalone/ })).toBeNull()
+  })
+
+  // Refresh frees its button after a minute, but a large catalogue outlasts
+  // that (#3058): the reload still sees the sync running, so the page keeps
+  // watching it and shows the result when it ends.
+  it('frees the button after a minute and keeps watching a longer sync', async () => {
     renderAuthorDetailPage(oldBooks, 'grid', { description: 'Old bio' })
     await screen.findByRole('heading', { name: 'Ancillary Justice' })
 
     vi.useFakeTimers()
-    serveSyncFinishingAt(Date.now() + 10 * 60 * 1000)
+    serveSyncFinishingAt(Date.now() + 3 * 60 * 1000)
     vi.mocked(api.refreshAuthor).mockResolvedValue(undefined)
 
     fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
@@ -1208,9 +1416,14 @@ describe('AuthorDetailPage: manual refresh', () => {
     expect(screen.getByRole('button', { name: 'Refreshing…' })).toBeDisabled()
     await advance(2000)
     expect(screen.getByRole('button', { name: 'Refresh' })).toBeEnabled()
+    expect(screen.getByRole('status')).toHaveTextContent('Fetching this author’s catalogue')
+
+    await advance(2 * 60 * 1000 + 10000)
+    expect(screen.getByRole('heading', { name: 'Translation State' })).toBeInTheDocument()
+    expect(screen.queryByRole('status')).toBeNull()
 
     const calls = vi.mocked(api.getAuthor).mock.calls.length
-    await advance(10000)
+    await advance(30000)
     expect(vi.mocked(api.getAuthor).mock.calls.length).toBe(calls)
   })
 
@@ -1647,5 +1860,217 @@ describe('AuthorDetailPage — selection (#2456, #2457)', () => {
     fireEvent.click(checkboxFor('Row One'))
     fireEvent.click(rowForTitle('Row Two'))
     await waitFor(() => expect(seen).toBe('/book/902'))
+  })
+})
+
+// An author whose catalogue sync is still running when the page opens, which
+// is every author straight after an add, must not read as having no books
+// (#3058).
+describe('AuthorDetailPage: sync running on load', () => {
+  const books = [makeBook({ id: 1, title: 'Fjellvinden', status: 'wanted' })]
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    installLocalStorageMock()
+    vi.mocked(api.listAuthorSeries).mockResolvedValue([])
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  // One act per second, so React renders between ticks as it does in a
+  // browser (a single long act batches every update to its end).
+  async function advance(ms: number) {
+    for (let left = ms; left > 0; left -= 1000) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(Math.min(1000, left))
+      })
+    }
+  }
+
+  // Serves the author as syncing with no books until finishAt, then synced
+  // with the books it found.
+  function serveSyncFinishingAt(finishAt: number, found: Book[]) {
+    const synced = () => Date.now() >= finishAt
+    vi.mocked(api.getAuthor).mockImplementation(async () => ({ ...author, syncInProgress: !synced() }))
+    vi.mocked(api.listAllBooks).mockImplementation(async () => (synced() ? found : []))
+  }
+
+  function renderPage() {
+    return render(
+      <MemoryRouter initialEntries={['/author/42']}>
+        <Routes>
+          <Route path="/author/:id" element={<AuthorDetailPage />} />
+        </Routes>
+      </MemoryRouter>,
+    )
+  }
+
+  it('shows the sync instead of the empty state, then the books when it ends', async () => {
+    serveSyncFinishingAt(Date.now() + 5 * 60 * 1000, books)
+    renderPage()
+
+    expect(await screen.findByRole('status')).toHaveTextContent('Fetching this author’s catalogue')
+    expect(screen.queryByText('No books tracked for this author yet.')).toBeNull()
+
+    // No time limit: a catalogue that takes five minutes is still picked up.
+    await advance(5 * 60 * 1000 + 10000)
+    expect(screen.getByRole('heading', { name: 'Fjellvinden' })).toBeInTheDocument()
+    expect(screen.queryByRole('status')).toBeNull()
+
+    const calls = vi.mocked(api.getAuthor).mock.calls.length
+    await advance(30000)
+    expect(vi.mocked(api.getAuthor).mock.calls.length).toBe(calls)
+  })
+
+  it('backs off to one poll every ten seconds', async () => {
+    serveSyncFinishingAt(Date.now() + 60 * 60 * 1000, books)
+    renderPage()
+    await screen.findByRole('status')
+
+    await advance(2 * 60 * 1000)
+    const before = vi.mocked(api.getAuthor).mock.calls.length
+    await advance(60 * 1000)
+    expect(vi.mocked(api.getAuthor).mock.calls.length - before).toBe(6)
+  })
+
+  it('keeps polling through a failed poll', async () => {
+    serveSyncFinishingAt(Date.now() + 5000, books)
+    vi.mocked(api.getAuthor)
+      .mockResolvedValueOnce({ ...author, syncInProgress: true })
+      .mockRejectedValueOnce(new Error('network'))
+    renderPage()
+    await screen.findByRole('status')
+
+    await advance(15000)
+    expect(screen.getByRole('heading', { name: 'Fjellvinden' })).toBeInTheDocument()
+  })
+
+  it('shows the empty state once a sync ends having found nothing', async () => {
+    serveSyncFinishingAt(Date.now() + 1000, [])
+    renderPage()
+    await screen.findByRole('status')
+
+    await advance(3000)
+    expect(screen.getByText('No books tracked for this author yet.')).toBeInTheDocument()
+    expect(screen.queryByRole('status')).toBeNull()
+  })
+
+  it('keeps the spinner a circle on a narrow screen (shrink-0)', async () => {
+    serveSyncFinishingAt(Date.now() + 60 * 1000, books)
+    renderPage()
+    const status = await screen.findByRole('status')
+    expect(status.querySelector('span[aria-hidden="true"]')).toHaveClass('shrink-0')
+  })
+
+  it('keeps polling when the reload after the sync ends fails, until one succeeds', async () => {
+    // Poll 1 sees the sync end; the next two getAuthor calls (the reload) fail.
+    let calls = 0
+    vi.mocked(api.getAuthor).mockImplementation(async () => {
+      calls++
+      if (calls === 1) return { ...author, syncInProgress: true }
+      if (calls === 2) return { ...author, syncInProgress: false }
+      if (calls <= 4) throw new Error('boom')
+      return { ...author, syncInProgress: false }
+    })
+    vi.mocked(api.listAllBooks).mockResolvedValue(books)
+    renderPage()
+    await screen.findByRole('status')
+
+    await advance(60 * 1000)
+    expect(screen.getByRole('heading', { name: 'Fjellvinden' })).toBeInTheDocument()
+    expect(screen.queryByRole('status')).toBeNull()
+    expect(screen.queryByText('boom')).toBeNull()
+  })
+
+  it('gives up after a few failed reloads: the error shows, the fetching state does not, polling stops', async () => {
+    let calls = 0
+    vi.mocked(api.getAuthor).mockImplementation(async () => {
+      calls++
+      if (calls === 1) return { ...author, syncInProgress: true }
+      if (calls % 2 === 0) return { ...author, syncInProgress: false }
+      throw new Error('boom')
+    })
+    vi.mocked(api.listAllBooks).mockResolvedValue(books)
+    renderPage()
+    await screen.findByRole('status')
+
+    await advance(5 * 60 * 1000)
+    expect(screen.getByText('boom')).toBeInTheDocument()
+    expect(screen.queryByRole('status')).toBeNull()
+    const seen = vi.mocked(api.getAuthor).mock.calls.length
+    await advance(60 * 1000)
+    expect(vi.mocked(api.getAuthor).mock.calls.length).toBe(seen)
+  })
+
+  it('gives up after a few failed polls in a row', async () => {
+    vi.mocked(api.getAuthor)
+      .mockResolvedValueOnce({ ...author, syncInProgress: true })
+      .mockRejectedValue(new Error('network'))
+    vi.mocked(api.listAllBooks).mockResolvedValue([])
+    renderPage()
+    await screen.findByRole('status')
+
+    await advance(5 * 60 * 1000)
+    expect(screen.queryByRole('status')).toBeNull()
+    const seen = vi.mocked(api.getAuthor).mock.calls.length
+    expect(seen).toBe(4)
+    await advance(60 * 1000)
+    expect(vi.mocked(api.getAuthor).mock.calls.length).toBe(seen)
+  })
+
+  it.each([404, 403])('stops at once on a %i: the author is gone or not this user\'s', async status => {
+    vi.mocked(api.getAuthor)
+      .mockResolvedValueOnce({ ...author, syncInProgress: true })
+      .mockRejectedValue(new ApiError(status, { error: 'nope' }, 'Not Found'))
+    vi.mocked(api.listAllBooks).mockResolvedValue([])
+    renderPage()
+    await screen.findByRole('status')
+
+    await advance(3000)
+    expect(screen.queryByRole('status')).toBeNull()
+    const seen = vi.mocked(api.getAuthor).mock.calls.length
+    expect(seen).toBe(2)
+    await advance(60 * 1000)
+    expect(vi.mocked(api.getAuthor).mock.calls.length).toBe(seen)
+  })
+
+  describe('in a hidden tab', () => {
+    function setHidden(hidden: boolean) {
+      Object.defineProperty(document, 'hidden', { configurable: true, get: () => hidden })
+      document.dispatchEvent(new Event('visibilitychange'))
+    }
+    afterEach(() => { Reflect.deleteProperty(document, 'hidden') })
+
+    it('stops polling while hidden and catches up when the tab returns (#2360)', async () => {
+      serveSyncFinishingAt(Date.now() + 60 * 60 * 1000, books)
+      renderPage()
+      await screen.findByRole('status')
+
+      await act(async () => { setHidden(true) })
+      const hiddenAt = vi.mocked(api.getAuthor).mock.calls.length
+      await advance(2 * 60 * 1000)
+      expect(vi.mocked(api.getAuthor).mock.calls.length).toBe(hiddenAt)
+
+      await act(async () => { setHidden(false) })
+      expect(vi.mocked(api.getAuthor).mock.calls.length).toBe(hiddenAt + 1)
+    })
+  })
+
+  it('says books appear when it finishes only while there are none yet', async () => {
+    serveSyncFinishingAt(Date.now() + 60 * 1000, books)
+    renderPage()
+    expect(await screen.findByRole('status')).toHaveTextContent('Books appear here when it finishes')
+
+    // A scheduled refresh over an author who already has books.
+    vi.mocked(api.getAuthor).mockImplementation(async () => ({ ...author, syncInProgress: true }))
+    vi.mocked(api.listAllBooks).mockImplementation(async () => books)
+    cleanup()
+    renderPage()
+    await screen.findByRole('heading', { name: 'Fjellvinden' })
+    expect(screen.getByRole('status')).not.toHaveTextContent('Books appear here when it finishes')
+    expect(screen.getByRole('status')).toHaveTextContent('Fetching this author’s catalogue')
   })
 })

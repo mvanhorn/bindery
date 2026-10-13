@@ -1,29 +1,36 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link, useLocation, useNavigate, useParams } from 'react-router'
 import { useTranslation } from 'react-i18next'
-import { api, BINDERY_BASE, Book, HistoryEvent, MediaType, SearchResult, SearchDebug, Series } from '../api/client'
+import { api, BINDERY_BASE, Book, BookSeriesExclusion, HistoryEvent, MediaType, SearchResult, SearchDebug, Series } from '../api/client'
 import SearchDebugPanel from '../components/SearchDebugPanel'
 import CoverPlaceholder from '../components/CoverPlaceholder'
+import BookRating from '../components/BookRating'
 import MarkdownDescription from '../components/MarkdownDescription'
 import MoreMenu from '../components/MoreMenu'
 import Section from '../components/Section'
 import Switch from '../components/Switch'
 import { btn, btnSize, dangerLink } from '../components/buttons'
+import { useIsAdmin } from '../auth/AuthContext'
 import MediaBadge from '../components/MediaBadge'
 import CalibreDeliveryChip from '../components/CalibreDeliveryChip'
 import { bookStatusBadge } from '../components/bookStatus'
 import RebindModal from '../components/RebindModal'
 import RenameFilesModal from '../components/RenameFilesModal'
 import ConfirmDialog from '../components/ConfirmDialog'
+import { useConfirmDialog } from '../components/useConfirmDialog'
+import { grabWithForceConfirm } from '../util/forceGrab'
 import ClipboardManualFallback from '../components/ClipboardManualFallback'
 import { useClipboardCopy } from '../components/useClipboardCopy'
 import { isAutoGrabRefusal } from '../util/autoGrabRefusal'
 import { safeHref } from '../util/safeHref'
-import { metadataSourceLink, providerDisplayName, providerFromBookForeignId } from '../util/metadataSource'
+import { metadataRetrievedDate, metadataSourceLink, providerDisplayName, providerFromBookForeignId } from '../util/metadataSource'
 import FixMatchModal from '../components/FixMatchModal'
 import EditBookModal from '../components/EditBookModal'
 import { formatBytes } from '../util/format'
 import MetadataLinksMenu from '../components/MetadataLinksMenu'
+import { usePolling } from '../components/usePolling'
+import { languageName } from '../util/language'
+import CoverImage from '../components/CoverImage'
 
 function formatDuration(seconds?: number): string {
   if (!seconds || seconds <= 0) return ''
@@ -31,29 +38,6 @@ function formatDuration(seconds?: number): string {
   const m = Math.floor((seconds % 3600) / 60)
   if (h > 0) return `${h}h ${m}m`
   return `${m}m`
-}
-
-// Maps ISO-639 language codes (both 639-1 two-letter and 639-2/B three-letter
-// forms) to a full English name. Codes outside this short list fall back to the
-// raw code — indexers and metadata providers only reliably tag a few majors.
-const LANGUAGE_NAMES: Record<string, string> = {
-  en: 'English', eng: 'English',
-  fr: 'French', fre: 'French', fra: 'French',
-  de: 'German', ger: 'German', deu: 'German',
-  nl: 'Dutch', dut: 'Dutch', nld: 'Dutch',
-  es: 'Spanish', spa: 'Spanish',
-  it: 'Italian', ita: 'Italian',
-  pt: 'Portuguese', por: 'Portuguese',
-  ja: 'Japanese', jpn: 'Japanese',
-  zh: 'Chinese', chi: 'Chinese', zho: 'Chinese',
-  ru: 'Russian', rus: 'Russian',
-  tl: 'Tagalog', tgl: 'Tagalog',
-  id: 'Indonesian', ind: 'Indonesian',
-}
-
-function languageName(code?: string): string | null {
-  if (!code) return null
-  return LANGUAGE_NAMES[code.toLowerCase()] ?? code
 }
 
 /** Final path segment, for labelling row-level controls. */
@@ -279,6 +263,9 @@ export default function BookDetailPage() {
 
 function BookDetailPageInner() {
   const { t } = useTranslation()
+  // The page has its own ConfirmDialog states; this one only asks before a
+  // forced grab of a release Bindery already imported (#2289).
+  const { confirm: forceConfirm, confirmDialog: forceConfirmDialog } = useConfirmDialog()
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
   const location = useLocation()
@@ -293,6 +280,18 @@ function BookDetailPageInner() {
   const [autoSearchNotice, setAutoSearchNotice] = useState<string | null>(null)
   const [results, setResults] = useState<SearchResult[] | null>(null)
   const [searchDebug, setSearchDebug] = useState<SearchDebug | null>(null)
+  // #1636: the results of an interactive search render below the metadata
+  // sections, often well below the fold, and a sweep can take 10 to 18
+  // seconds. revealResults is set when a search finishes so the effect below
+  // can scroll the results region into view once React has rendered it.
+  const searchResultsRef = useRef<HTMLDivElement>(null)
+  const [revealResults, setRevealResults] = useState(false)
+  // Set when the reader scrolls on their own while the search runs. They
+  // went somewhere on purpose, so the finished search must not pull them
+  // back. Input events rather than 'scroll', because clearing the previous
+  // results shortens the page and the browser's own scroll clamp fires
+  // 'scroll' with no reader involved.
+  const userScrolledDuringSearch = useRef(false)
   const [hasIndexers, setHasIndexers] = useState<boolean | null>(null)
   const [grabbing, setGrabbing] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -332,6 +331,9 @@ function BookDetailPageInner() {
   const [seriesBusy, setSeriesBusy] = useState(false)
   const [removeSeries, setRemoveSeries] = useState<{ id: number; title: string } | null>(null)
   const [seriesNonce, setSeriesNonce] = useState(0)
+  // Series the user took this book out of (#2554). Refreshes leave it out
+  // of these; Restore puts it back where it was.
+  const [keptOut, setKeptOut] = useState<BookSeriesExclusion[]>([])
 
   useEffect(() => {
     if (book?.title) {
@@ -351,6 +353,24 @@ function BookDetailPageInner() {
       .finally(() => { if (!cancelled) setLoading(false) })
     return () => { cancelled = true }
   }, [bookId, t])
+
+  // Live refresh while an import is in flight (#2423). It arms on the
+  // server's importInFlight flag: a download for this book that is still on
+  // its way into the library. The first version (#1161) armed on book statuses
+  // nothing ever wrote, so it never ran. Each tick reloads the book, and the
+  // reload that comes back with the flag cleared disarms the poll and pulls the
+  // history once more so the import shows up there too. The ASIN draft is left
+  // alone, since the user may be typing in it.
+  usePolling(() => {
+    api.getBook(bookId)
+      .then(b => {
+        setBook(b)
+        if (!b.importInFlight) {
+          api.listHistory({ bookId }).then(({ items }) => setEvents(items)).catch(() => {})
+        }
+      })
+      .catch(() => {})
+  }, 5000, Boolean(book?.importInFlight))
 
   // Series membership. There is no book→series endpoint, so this reuses the
   // author's series list and picks out this book's entries — deliberately not a
@@ -381,8 +401,32 @@ function BookDetailPageInner() {
         setSeries(mine)
       })
       .catch(() => { /* no series row */ })
+    api.getBookSeriesExclusions(id)
+      .then(list => { if (!cancelled) setKeptOut(list) })
+      .catch(() => { /* nothing to show */ })
     return () => { cancelled = true }
   }, [book?.authorId, book?.id, seriesNonce])
+
+  // Puts the book back in a series it was taken out of, at the position it
+  // had, as its primary series only when it has none. Linking by hand clears
+  // the exclusion on the server.
+  const restoreSeries = async (e: BookSeriesExclusion) => {
+    if (!book) return
+    setSeriesBusy(true)
+    setError(null)
+    try {
+      await api.linkBookToSeries(e.seriesId, { bookId: book.id, positionInSeries: e.position, primarySeries: !series.some(s => s.primary) })
+      setSeriesNonce(n => n + 1)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t('bookDetail.series.restoreFailed'))
+    } finally {
+      setSeriesBusy(false)
+    }
+  }
+  // Series changes are admin only (#468): other users see the book's series
+  // without the controls, and nothing to restore.
+  const isAdmin = useIsAdmin()
+  const restorable = isAdmin ? keptOut.filter(e => e.seriesId > 0) : []
 
   // #2525: the renamer reads one series per book. When a book sits in both its
   // real series and an umbrella "Universe" one, these are how the user says
@@ -413,6 +457,22 @@ function BookDetailPageInner() {
       setError(err instanceof Error ? err.message : t('bookDetail.series.removeFailed'))
     } finally {
       setSeriesBusy(false)
+    }
+  }
+
+  // Sets the cover from an image the user picks (#3017). It replaces the
+  // current cover, and refresh only fills an empty one, so it stays.
+  const [uploadingCover, setUploadingCover] = useState(false)
+  const uploadCover = async (file: File | undefined) => {
+    if (!book || !file) return
+    setUploadingCover(true)
+    setError(null)
+    try {
+      setBook(await api.uploadBookCover(book.id, file))
+    } catch (e) {
+      setError(e instanceof Error ? e.message : t('bookDetail.cover.uploadFailed', 'Could not upload the cover'))
+    } finally {
+      setUploadingCover(false)
     }
   }
 
@@ -448,12 +508,44 @@ function BookDetailPageInner() {
       setHasIndexers(indexers.length > 0)
       setResults(r.results)
       setSearchDebug(r.debug ?? null)
+      setRevealResults(true)
     } catch (e) {
       setError(e instanceof Error ? e.message : t('bookDetail.searchFailed'))
     } finally {
       setSearching(false)
     }
   }
+
+  useEffect(() => {
+    if (!searching) return
+    userScrolledDuringSearch.current = false
+    const scrollKeys = new Set(['ArrowDown', 'ArrowUp', 'PageDown', 'PageUp', 'Home', 'End', ' '])
+    const onScrollIntent = () => { userScrolledDuringSearch.current = true }
+    const onKey = (e: KeyboardEvent) => { if (scrollKeys.has(e.key)) onScrollIntent() }
+    window.addEventListener('wheel', onScrollIntent, { passive: true })
+    window.addEventListener('touchmove', onScrollIntent, { passive: true })
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('wheel', onScrollIntent)
+      window.removeEventListener('touchmove', onScrollIntent)
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [searching])
+
+  useEffect(() => {
+    if (!revealResults) return
+    setRevealResults(false)
+    if (userScrolledDuringSearch.current) return
+    const el = searchResultsRef.current
+    // jsdom and some older engines have no scrollIntoView.
+    if (!el || typeof el.scrollIntoView !== 'function') return
+    // Already on screen: scrolling would only move the page for nothing.
+    const top = el.getBoundingClientRect().top
+    if (top >= 0 && top < window.innerHeight) return
+    const reduceMotion = typeof window.matchMedia === 'function'
+      && window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    el.scrollIntoView({ block: 'start', behavior: reduceMotion ? 'auto' : 'smooth' })
+  }, [revealResults])
 
   // #2668 (ThatDeltaGuy): the automatic counterpart of runSearch above. That
   // one is POST /book/{id}/search, which returns releases and grabs nothing,
@@ -494,7 +586,7 @@ function BookDetailPageInner() {
     setGrabbing(r.guid)
     setError(null)
     try {
-      await api.grab({
+      const dl = await grabWithForceConfirm({
         guid: r.guid,
         title: r.title,
         nzbUrl: r.nzbUrl,
@@ -509,7 +601,8 @@ function BookDetailPageInner() {
         // this is the format the user picked; single-format searches leave it
         // unset and the book's own type is the answer.
         mediaType: r.mediaType || book.mediaType,
-      })
+      }, forceConfirm, t)
+      if (!dl) return
       // Refresh book + history
       const [b, h] = await Promise.all([
         api.getBook(book.id),
@@ -749,6 +842,7 @@ function BookDetailPageInner() {
     return rows
   })()
   const sourceLinks = identityRows.flatMap(row => row.link ? [row.link] : [])
+  const bnfRetrieved = metadataRetrievedDate(book)
 
   // Display truth is the file inventory, never the declared media type.
   const rows = fileRows(book)
@@ -814,21 +908,34 @@ function BookDetailPageInner() {
     // (7xl vs 4xl), so author → book collapsed the content by 384px and
     // left-aligned it mid-navigation.
     <div className="max-w-7xl">
+      {forceConfirmDialog}
       {navRow}
 
       {/* ===== Header: cover + metadata ===== */}
       <div className="flex flex-col sm:flex-row gap-6">
         <div className="w-32 flex-shrink-0">
-          {book.imageUrl ? (
-            <img src={book.imageUrl} alt={book.title} className="w-full rounded-lg" />
-          ) : (
-            <CoverPlaceholder id={book.id} title={book.title} className="aspect-[2/3] rounded-lg" />
-          )}
+          <CoverImage src={book.imageUrl} alt={book.title} className="w-full rounded-lg"
+            fallback={
+              <CoverPlaceholder id={book.id} title={book.title} className="aspect-[2/3] rounded-lg" />
+            }
+          />
+          <label className={`touch-target mt-2 block text-center text-xs text-accent-text hover:underline cursor-pointer has-[:focus-visible]:underline ${uploadingCover ? 'opacity-50 pointer-events-none' : ''}`}>
+            {uploadingCover
+              ? t('bookDetail.cover.uploading', 'Uploading…')
+              : book.imageUrl ? t('bookDetail.cover.change', 'Change cover') : t('bookDetail.cover.upload', 'Upload cover')}
+            <input
+              type="file"
+              accept="image/jpeg,image/png,image/webp,image/gif"
+              className="sr-only"
+              disabled={uploadingCover}
+              onChange={e => { void uploadCover(e.target.files?.[0]); e.target.value = '' }}
+            />
+          </label>
         </div>
         <div className="min-w-0 flex-1">
           <div className="flex items-start justify-between gap-3">
             <div className="min-w-0">
-              <h2 className="text-2xl font-semibold text-slate-900 dark:text-white">{book.title}</h2>
+              <h2 className="text-2xl font-semibold text-slate-900 dark:text-white [overflow-wrap:anywhere]">{book.title}</h2>
               {book.author?.authorName && (
                 <Link
                   to={`/author/${book.authorId}`}
@@ -896,6 +1003,12 @@ function BookDetailPageInner() {
                 {t('bookDetail.languageUnknown')}
               </span>
             )}
+            {book.averageRating && book.averageRating > 0 ? (
+              <>
+                <span aria-hidden className="text-slate-400 dark:text-zinc-600">·</span>
+                <BookRating book={book} withCount className="text-slate-600 dark:text-zinc-400" />
+              </>
+            ) : null}
             {book.narrator && (
               <>
                 <span aria-hidden className="text-slate-400 dark:text-zinc-600">·</span>
@@ -965,9 +1078,19 @@ function BookDetailPageInner() {
             <button
               onClick={runSearch}
               disabled={searching}
+              aria-busy={searching}
               className={`${btn.primary} ${btnSize.md}`}
             >
-              <span aria-hidden>🔍</span> {searchLabel}
+              {searching ? (
+                <span
+                  data-testid="search-spinner"
+                  aria-hidden
+                  className="inline-block h-3.5 w-3.5 align-[-2px] animate-spin rounded-full border-2 border-current border-t-transparent"
+                />
+              ) : (
+                <span aria-hidden>🔍</span>
+              )}{' '}
+              {searchLabel}
             </button>
             {canAutoSearch && (
               <button
@@ -1000,8 +1123,9 @@ function BookDetailPageInner() {
           Only when a book is in more than one series. With a single membership
           there is nothing to choose and nothing to correct, so the meta row
           above already says everything. */}
-      {series.length > 1 && (
+      {(series.length > 1 || restorable.length > 0) && (
         <Section title={t('bookDetail.series.heading')}>
+          {series.length > 1 && (<>
           <p className="text-xs text-slate-500 dark:text-zinc-500">{t('bookDetail.series.explainer')}</p>
           <ul className="mt-3 space-y-2">
             {series.map(s => (
@@ -1017,7 +1141,7 @@ function BookDetailPageInner() {
                 </span>
                 {s.primary ? (
                   <span className="text-xs text-slate-500 dark:text-zinc-500">{t('bookDetail.series.namesFiles')}</span>
-                ) : (
+                ) : isAdmin && (
                   <button
                     type="button"
                     className={`${btn.ghost} ${btnSize.sm}`}
@@ -1027,17 +1151,39 @@ function BookDetailPageInner() {
                     {t('bookDetail.series.useForNaming')}
                   </button>
                 )}
-                <button
-                  type="button"
-                  className={`${dangerLink} text-xs disabled:opacity-50`}
-                  disabled={seriesBusy}
-                  onClick={() => setRemoveSeries({ id: s.id, title: s.title })}
-                >
-                  {t('bookDetail.series.remove')}
-                </button>
+                {isAdmin && (
+                  <button
+                    type="button"
+                    className={`${dangerLink} text-xs disabled:opacity-50`}
+                    disabled={seriesBusy}
+                    onClick={() => setRemoveSeries({ id: s.id, title: s.title })}
+                  >
+                    {t('bookDetail.series.remove')}
+                  </button>
+                )}
               </li>
             ))}
           </ul>
+          </>)}
+          {restorable.length > 0 && (
+            <div className={series.length > 1 ? 'mt-4' : ''}>
+              <p className="text-xs text-slate-500 dark:text-zinc-500">{t('bookDetail.series.keptOutExplainer')}</p>
+              <ul className="mt-2 space-y-2" aria-label={t('bookDetail.series.keptOutHeading')}>
+                {restorable.map(e => (
+                  <li key={e.seriesForeignId} className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
+                    <span className="text-slate-500 dark:text-zinc-400 line-through decoration-slate-400">
+                      {e.position
+                        ? t('bookDetail.seriesPosition', { series: e.seriesTitle, position: e.position, defaultValue: '{{series}} #{{position}}' })
+                        : e.seriesTitle}
+                    </span>
+                    <button type="button" className={`touch-target ${btn.ghost} ${btnSize.sm}`} disabled={seriesBusy} onClick={() => restoreSeries(e)}>
+                      {t('bookDetail.series.restore')}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
         </Section>
       )}
 
@@ -1101,7 +1247,7 @@ function BookDetailPageInner() {
                             paths: group.rows.map(r => r.path),
                           })}
                           disabled={deletingFile || deregistering || deletingBook}
-                          className={`${btn.danger} ${btnSize.md}`}
+                          className={`${btn.danger} ${btnSize.sm}`}
                         >
                           <span aria-hidden>🗑 </span>
                           {group.rows.length > 1 ? t('bookDetail.deleteFiles') : t('bookDetail.deleteFile')}
@@ -1115,7 +1261,7 @@ function BookDetailPageInner() {
                             className="px-3 py-2 flex items-center gap-2 min-w-0 border-t first:border-t-0 border-slate-100 dark:border-zinc-900"
                           >
                             <code
-                              className="font-mono text-xs text-slate-500 dark:text-zinc-500 truncate"
+                              className="min-w-0 font-mono text-xs text-slate-500 dark:text-zinc-500 break-all sm:truncate"
                               title={row.path}
                             >
                               {row.path}
@@ -1158,7 +1304,7 @@ function BookDetailPageInner() {
                               items={[
                                 {
                                   label: t('bookDetail.fixMatch.button', 'Fix match'),
-                                  title: t('bookDetail.fixMatch.hint', 'Move this file to a different book'),
+                                  title: t('bookDetail.fixMatch.hint', 'Say which book this file really belongs to'),
                                   disabled: deletingFile || deregistering || deletingBook,
                                   onSelect: () => setFixMatchRow(row),
                                 },
@@ -1216,7 +1362,7 @@ function BookDetailPageInner() {
                 onClick={() => setFixMatchRow(rows[0])}
                 disabled={deletingFile || deregistering || deletingBook}
                 className={actionBtnCls}
-                title={t('bookDetail.fixMatch.hint', 'Move this file to a different book')}
+                title={t('bookDetail.fixMatch.hint', 'Say which book this file really belongs to')}
               >
                 {t('bookDetail.fixMatch.button', 'Fix match')}
               </button>
@@ -1327,6 +1473,13 @@ function BookDetailPageInner() {
                     {t('common.viewOnSource', { source: row.link.label, defaultValue: 'View on {{source}} ↗' })}
                   </a>
                 )}
+                {/* BnF's Licence Ouverte asks for the source and the date
+                    wherever its data is shown (#3144). */}
+                {row.primary && row.provider === 'bnf' && bnfRetrieved && (
+                  <span className="text-xs text-slate-600 dark:text-zinc-500 basis-full" data-testid="bnf-source-credit">
+                    {t('common.bnfSourceCredit', { date: bnfRetrieved, defaultValue: 'Data from the BnF, Licence Ouverte / Open Licence 2.0, retrieved {{date}}' })}
+                  </span>
+                )}
               </li>
             ))}
           </ul>
@@ -1352,6 +1505,9 @@ function BookDetailPageInner() {
                 </label>
                 <input
                   id="book-asin"
+                  autoCapitalize="characters"
+                  autoCorrect="off"
+                  spellCheck={false}
                   value={asinDraft}
                   onChange={e => setAsinDraft(e.target.value.toUpperCase())}
                   placeholder="B08GB58KD5"
@@ -1372,48 +1528,61 @@ function BookDetailPageInner() {
                 disabled={!book.asin || enriching}
                 className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded text-sm font-medium disabled:opacity-40"
                 title={book.asin ? t('bookDetail.enrichHint') : t('bookDetail.enrichHintNoAsin')}
+                aria-describedby={book.asin ? undefined : 'book-enrich-no-asin'}
               >
                 {enriching ? t('bookDetail.enriching') : t('bookDetail.enrich')}
               </button>
             </div>
+            {/* Why Enrich is disabled. The title tooltip says it with a mouse;
+                a disabled button gets no hover or tap on a touch screen, so
+                there the reason is written out under the row. */}
+            {!book.asin && (
+              <p id="book-enrich-no-asin" className="hidden pointer-coarse:block mt-1 text-xs text-fg-muted">
+                {t('bookDetail.enrichHintNoAsin')}
+              </p>
+            )}
           </div>
         </Section>
       )}
 
-      {/* ===== Search results ===== */}
-      {results !== null && results.length === 0 && (
-        <div className="mt-6 text-center py-6 text-sm text-slate-600 dark:text-zinc-500 border border-slate-200 dark:border-zinc-800 rounded-lg bg-slate-100 dark:bg-zinc-900">
-          {hasIndexers === false ? (
-            <>
-              {t('bookDetail.noIndexers')}{' '}
-              <Link to="/settings" className="underline">{t('nav.settings')}</Link>.
-            </>
-          ) : (
-            t('bookDetail.noResults')
-          )}
-        </div>
-      )}
+      {/* ===== Search results =====
+          One region so a finished search can scroll it into view (#1636).
+          scroll-mt clears the sticky header. */}
+      <div ref={searchResultsRef} data-testid="search-results-region" className="scroll-mt-20">
+        {results !== null && results.length === 0 && (
+          <div className="mt-6 text-center py-6 text-sm text-slate-600 dark:text-zinc-500 border border-slate-200 dark:border-zinc-800 rounded-lg bg-slate-100 dark:bg-zinc-900">
+            {hasIndexers === false ? (
+              <>
+                {t('bookDetail.noIndexers')}{' '}
+                <Link to="/settings" className="underline">{t('nav.settings')}</Link>.
+              </>
+            ) : (
+              t('bookDetail.noResults')
+            )}
+          </div>
+        )}
 
-      {searchDebug && (
-        <div className="mt-6">
-          <SearchDebugPanel
-            debug={searchDebug}
-            resultCount={results?.length ?? 0}
-            defaultOpen={results !== null && results.length === 0}
-          />
-        </div>
-      )}
+        {searchDebug && (
+          <div className="mt-6">
+            <SearchDebugPanel
+              debug={searchDebug}
+              resultCount={results?.length ?? 0}
+              defaultOpen={results !== null && results.length === 0}
+            />
+          </div>
+        )}
 
-      {results !== null && results.length > 0 && (
-        <div className="mt-6">
-          <SearchResultsSection
-            results={results}
-            bookMediaType={book.mediaType}
-            grabbing={grabbing}
-            onGrab={grab}
-          />
-        </div>
-      )}
+        {results !== null && results.length > 0 && (
+          <div className="mt-6">
+            <SearchResultsSection
+              results={results}
+              bookMediaType={book.mediaType}
+              grabbing={grabbing}
+              onGrab={grab}
+            />
+          </div>
+        )}
+      </div>
 
       {/* ===== History section ===== */}
       {events.length > 0 && (
@@ -1445,6 +1614,8 @@ function BookDetailPageInner() {
           book={book}
           onClose={() => setShowEdit(false)}
           onSaved={updated => setBook(updated)}
+          onSeriesSaved={() => setSeriesNonce(n => n + 1)}
+          seriesExclusions={keptOut.length}
         />
       )}
       {showRebind && (

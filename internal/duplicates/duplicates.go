@@ -150,38 +150,39 @@ func AggressiveTitleKey(title string) string {
 	return strings.Join(foldWords(title), "")
 }
 
-// leadingArticles are the whole-word leading articles dropped by the
-// article-strip rule. Deliberately a closed list, matched as a complete first
-// word: "Theatre of Blood" must not collapse because "Theatre" starts with
-// "the".
-var leadingArticles = map[string]struct{}{
-	// English
-	"the": {}, "a": {}, "an": {},
-	// German
-	"der": {}, "die": {}, "das": {},
-	// French / Spanish / Portuguese
-	"le": {}, "la": {}, "les": {}, "el": {}, "los": {}, "las": {}, "de": {},
-	// Italian
-	"il": {}, "gli": {}, "una": {},
-	// Dutch
-	"een": {}, "het": {},
-}
+// The article list lives in textutil (textutil.IsArticle) so this rule and the
+// persisted books.dedup_key read the filing form from one definition (#3122).
 
 // dropLeadingArticle removes the first word when it is a whole-word leading
 // article. The len > 1 guard keeps a title that IS an article ("A", "Die")
 // from keying to empty — an empty key must never match anything.
 func dropLeadingArticle(words []string) []string {
 	if len(words) > 1 {
-		if _, ok := leadingArticles[words[0]]; ok {
+		if textutil.IsArticle(words[0]) {
 			return words[1:]
 		}
 	}
 	return words
 }
 
-// ArticleKey is the aggressive key with any leading article dropped.
+// dropArticle is dropLeadingArticle that also understands the library
+// filing form, where the article is moved behind a comma: "Trace of Death, A"
+// is "A Trace of Death" (#1691). The comma has to be read from the raw title,
+// because folding turns it into a space. Only a lone article after the last
+// comma counts, so "Love, Actually" and "Me, Myself and I" are left alone.
+func dropArticle(title string, words []string) []string {
+	if _, article, ok := textutil.SplitFilingForm(title); ok && len(words) > 1 {
+		if tail := foldWords(article); len(tail) == 1 && words[len(words)-1] == tail[0] {
+			return words[:len(words)-1]
+		}
+	}
+	return dropLeadingArticle(words)
+}
+
+// ArticleKey is the aggressive key with any leading article dropped, or a
+// trailing one in the "Title, The" filing form.
 func ArticleKey(title string) string {
-	return strings.Join(dropLeadingArticle(foldWords(title)), "")
+	return strings.Join(dropArticle(title, foldWords(title)), "")
 }
 
 // editionMarkers are the trailing qualifier sequences the edition-suffix rule
@@ -341,20 +342,48 @@ func MatchRules(a, b string) []RuleID {
 }
 
 // Member is one book in a candidate group, annotated with the rules that
-// fired for it against the other members.
+// fired for it against the other members. Evidence and HasFiles are filled by
+// Annotate (#2999); Scan and Detect leave them zero.
 type Member struct {
 	models.Book
-	Rules []RuleID `json:"rules"`
+	Rules    []RuleID `json:"rules"`
+	Evidence Evidence `json:"evidence"`
+	HasFiles bool     `json:"hasFiles"`
 }
 
 // Group is a set of books the detector believes may be the same work. A group
 // with a single member is never returned. Rules is the union of every rule
 // that fired on any pair within the group, so the UI can explain the group as
 // a whole.
+//
+// AuthorID is set by Detect. AuthorName, Signals, Conflict, KeeperID and
+// SuggestedExcludeIDs are review annotations (#2999): the caller fills the
+// name, Annotate fills the rest. None of them changes which books group.
 type Group struct {
-	Key     string   `json:"key"`
-	Rules   []RuleID `json:"rules"`
-	Members []Member `json:"books"`
+	Key        string   `json:"key"`
+	AuthorID   int64    `json:"authorId"`
+	AuthorName string   `json:"authorName,omitempty"`
+	Rules      []RuleID `json:"rules"`
+	Members    []Member `json:"books"`
+	// Signals are the agreements and conflicts Annotate found between the
+	// group's non-excluded members, in a stable order.
+	Signals []Signal `json:"signals"`
+	// Conflict is true when any signal is a conflict: the evidence says at
+	// least two members may be different books.
+	Conflict bool `json:"conflict"`
+	// KeeperID is the one non-excluded member that has files, or 0 when no
+	// member or more than one member has files. The UI marks it as the row to
+	// keep; it is never a suggestion to exclude anything.
+	KeeperID int64 `json:"keeperId,omitempty"`
+	// SuggestedExcludeIDs are the non-excluded members without files, offered
+	// as one confirmed "exclude the empty rows" action. It is non-empty only
+	// when there is a KeeperID, no conflict, and positive evidence linking
+	// every empty member to the keeper; it never contains a member that has
+	// files.
+	SuggestedExcludeIDs []int64 `json:"suggestedExcludeIds"`
+	// SuggestionWithheld says why SuggestedExcludeIDs is empty: one of the
+	// Withheld* values, or empty when there is a suggestion.
+	SuggestionWithheld string `json:"suggestionWithheld,omitempty"`
 }
 
 type bookKeys struct {
@@ -373,9 +402,9 @@ func bookKeyFor(title string) bookKeys {
 	words := foldWords(title)
 	return bookKeys{
 		alnum:    strings.Join(words, ""),
-		article:  strings.Join(dropLeadingArticle(words), ""),
+		article:  strings.Join(dropArticle(title, words), ""),
 		edition:  strings.Join(dropTrailingEditionMarkers(words), ""),
-		combined: strings.Join(dropTrailingEditionMarkers(dropLeadingArticle(words)), ""),
+		combined: strings.Join(dropTrailingEditionMarkers(dropArticle(title, words)), ""),
 		segments: titleSegments(title),
 	}
 }

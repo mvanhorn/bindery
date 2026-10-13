@@ -6,6 +6,7 @@ import { useClipboardCopy } from '../../components/useClipboardCopy'
 import SaveButton from './SaveButton'
 import Toggle from './Toggle'
 import { useSaveResult } from './useSaveResult'
+import { secretInputAttrs } from '../../util/inputAttrs'
 
 export default function ApiKeysTab() {
   const { t } = useTranslation()
@@ -92,6 +93,7 @@ export default function ApiKeysTab() {
     try {
       const result = await api.testHardcover()
       setHardcoverTestResult(result)
+      await refreshSystemStatus()
     } catch (err) {
       setHardcoverTestResult({
         ok: false,
@@ -140,13 +142,14 @@ export default function ApiKeysTab() {
         <div className="p-4 border border-slate-200 dark:border-zinc-800 rounded-lg bg-slate-100 dark:bg-zinc-900 space-y-4">
           <div>
             <label className="block text-xs text-slate-600 dark:text-zinc-400 mb-1">{t('settings.general.googleBooksKey')}</label>
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2">
               <input
+                {...secretInputAttrs}
                 value={settings['googlebooks.apiKey'] ?? ''}
                 onChange={e => setSettings(s => ({ ...s, 'googlebooks.apiKey': e.target.value }))}
                 placeholder={t('settings.general.googleBooksKeyHiddenPlaceholder', 'Saved key is hidden. Enter a new key to replace it.')}
                 type="password"
-                className="flex-1 bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-slate-400 dark:focus:border-zinc-600"
+                className="grow basis-48 min-w-0 bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-slate-400 dark:focus:border-zinc-600"
               />
               <SaveButton
                 result={googleKeyResult}
@@ -156,12 +159,19 @@ export default function ApiKeysTab() {
                 testId="save-googlebooks-key"
               />
             </div>
-            <p className="text-xs text-slate-500 dark:text-zinc-600 mt-1">
-              {t('settings.general.restartRequired')}
-            </p>
           </div>
 
           <div className="border-t border-slate-200 dark:border-zinc-800 pt-4 space-y-3">
+            {systemStatus?.hardcoverPausedUntil && Date.parse(systemStatus.hardcoverPausedUntil) > Date.now() && (
+              <p role="status" className="text-sm text-amber-700 dark:text-amber-400">
+                {t('settings.general.hardcoverPausedUntil', { time: new Date(systemStatus.hardcoverPausedUntil).toLocaleString() })}
+              </p>
+            )}
+            {systemStatus?.hardcoverTokenRejected && (
+              <p role="alert" className="text-sm text-red-700 dark:text-red-400">
+                {t('settings.general.hardcoverTokenRejected')}
+              </p>
+            )}
             <div>
               <div className="flex items-center justify-between gap-3 mb-1">
                 <label className="block text-xs text-slate-600 dark:text-zinc-400">
@@ -173,15 +183,16 @@ export default function ApiKeysTab() {
                     : t('settings.general.hardcoverTokenNotConfigured', 'No token configured')}
                 </span>
               </div>
-              <div className="flex gap-2">
+              <div className="flex flex-wrap gap-2">
                 <input
+                  {...secretInputAttrs}
                   value={hardcoverToken}
                   onChange={e => setHardcoverToken(e.target.value)}
                   placeholder={hardcoverTokenConfigured
                     ? t('settings.general.hardcoverApiTokenConfiguredPlaceholder', 'Saved token is hidden. Enter a new token to rotate it.')
                     : t('settings.general.hardcoverApiTokenPlaceholder', 'Paste a Hardcover API token')}
                   type="password"
-                  className="flex-1 bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-slate-400 dark:focus:border-zinc-600"
+                  className="grow basis-48 min-w-0 bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-slate-400 dark:focus:border-zinc-600"
                 />
                 <SaveButton
                   result={hardcoverTokenResult}

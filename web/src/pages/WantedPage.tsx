@@ -1,62 +1,115 @@
-import { useEffect, useRef, useState, useMemo, useCallback } from 'react'
+import { useEffect, useRef, useState, useCallback } from 'react'
 import { Link } from 'react-router'
 import { useTranslation } from 'react-i18next'
 import { api, Book, SearchResult } from '../api/client'
+import { useConfirmDialog } from '../components/useConfirmDialog'
+import { grabWithForceConfirm } from '../util/forceGrab'
 import BulkActionBar from '../components/BulkActionBar'
 import ImportHints from '../components/ImportHints'
 import Pagination from '../components/Pagination'
-import { usePagination } from '../components/usePagination'
-import { foldedIncludes } from '../util/foldForSearch'
+import { useServerPagination } from '../components/usePagination'
+import { useListParams, useUrlSearchInput } from '../components/useListParams'
 import { usePolling } from '../components/usePolling'
 import { safeHref } from '../util/safeHref'
 import { formatBytes } from '../util/format'
 import { isAutoGrabRefusal } from '../util/autoGrabRefusal'
+import CoverImage from '../components/CoverImage'
 
 // Shared grid template so the header row and every list row line up exactly.
 // columns: checkbox · cover · title+author · format · actions
-const ROW_GRID = 'grid grid-cols-[1.5rem_2rem_1fr_6rem_8.5rem] items-center gap-3'
+// Below sm the fixed format and action columns left the title about 13px at
+// 375px, so a phone gets three columns and the format and actions move to a
+// second line under the title (see ROW_CONTROLS). The format column fits the
+// longest format name in every locale ("📖 Libro electrónico") plus the room
+// index.css keeps for the select's arrow (#3148). Selects keep their own size
+// on touch screens too (#3081), so one width serves both.
+const ROW_GRID = 'grid grid-cols-[1.5rem_2rem_minmax(0,1fr)] sm:grid-cols-[1.5rem_2rem_1fr_9rem_8.5rem] items-center gap-x-3 gap-y-1.5 sm:gap-3'
+// Holds the format select and the actions. A flex line spanning the cover and
+// title columns on a phone; display: contents from sm, so its two children
+// drop back into their own grid columns.
+const ROW_CONTROLS = 'col-start-2 col-span-2 flex flex-wrap items-center gap-2 sm:contents'
+
+// Query-string keys and their defaults; defaults stay out of the URL.
+const LIST_DEFAULTS = { q: '', excluded: '' }
 
 export default function WantedPage() {
   const { t } = useTranslation()
+  const { confirm, confirmDialog } = useConfirmDialog()
 
+  // The current page of wanted books, and how many match the search in all.
   const [books, setBooks] = useState<Book[]>([])
+  const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(true)
   const [searchingId, setSearchingId] = useState<number | null>(null)
   const [results, setResults] = useState<SearchResult[]>([])
   const [showResults, setShowResults] = useState<number | null>(null)
-  const [search, setSearch] = useState('')
+  // Page, search and the excluded toggle live in the URL so going back from a
+  // book lands on the same page of the same list (#3052).
+  const list = useListParams(LIST_DEFAULTS)
+  const updateList = list.update
+  // The box follows every keystroke; the URL, and with it the server query,
+  // catches up once typing pauses, replacing the entry rather than pushing one
+  // per keystroke.
+  const commitSearch = useCallback((q: string) => updateList({ q, page: null }, { replace: true }), [updateList])
+  const [search, setSearch] = useUrlSearchInput(list.values.q, commitSearch)
   const [grabbingGuid, setGrabbingGuid] = useState<string | null>(null)
   const [grabbedGuid, setGrabbedGuid] = useState<string | null>(null)
   const [unmonitoringId, setUnmonitoringId] = useState<number | null>(null)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [bulkBusy, setBulkBusy] = useState(false)
-  const [showExcluded, setShowExcluded] = useState(false)
+  const showExcluded = list.values.excluded === '1'
+  const setShowExcluded = (next: boolean) => updateList({ excluded: next ? '1' : null })
   const [toast, setToast] = useState<string | null>(null)
   const selectAllRef = useRef<HTMLInputElement>(null)
 
-  const load = () => {
-    api.listWanted({ includeExcluded: showExcluded }).then(setBooks).catch(console.error).finally(() => setLoading(false))
-  }
-
-  // Guard against stale responses and set-state-after-unmount: a `cancelled`
-  // flag captured in the effect is checked before every setState and flipped in
-  // cleanup, so a request that resolves after a newer refetch or after unmount
-  // is ignored. Mirrors AuthorsPage's poll guard.
-  useEffect(() => {
-    let cancelled = false
-    api.listWanted({ includeExcluded: showExcluded })
-      .then(b => { if (!cancelled) setBooks(b) })
-      .catch(console.error)
-      .finally(() => { if (!cancelled) setLoading(false) })
-    return () => { cancelled = true }
-  }, [showExcluded])
-
-  // Set-state-after-unmount guard for the poll, which outlives any one effect.
+  // Set-state-after-unmount guard for the fetches and the poll, which outlive
+  // any one effect.
   const mounted = useRef(true)
   useEffect(() => {
     mounted.current = true
     return () => { mounted.current = false }
   }, [])
+
+  // The query a total belongs to, minus the page. The snap back to the last
+  // page may only use a total fetched for the query on screen (see BooksPage).
+  const searchQuery = list.values.q
+  const queryKey = JSON.stringify([searchQuery, showExcluded])
+  const [totalKey, setTotalKey] = useState<string | null>(null)
+  const { page, pageSize, paginationProps } = useServerPagination(total, 50, 'wanted', {
+    page: list.page,
+    setPage: list.setPage,
+    ready: totalKey === queryKey,
+  })
+
+  // The server pages and searches (limit, offset, search), so a library with
+  // thousands of wanted books is not serialised on every 5 second poll. Each
+  // request takes a number and only the newest may set state: a response that
+  // lands after a page change, a newer poll or an unmount is dropped.
+  const loadRequestRef = useRef(0)
+  const fetchPage = useCallback(() => {
+    const request = ++loadRequestRef.current
+    return api.listWantedPage({
+      limit: pageSize,
+      offset: (page - 1) * pageSize,
+      search: searchQuery || undefined,
+      includeExcluded: showExcluded,
+    }).then(({ items, total }) => {
+      if (request !== loadRequestRef.current || !mounted.current) return
+      setBooks(items)
+      setTotal(total)
+      setTotalKey(queryKey)
+    })
+  }, [page, pageSize, searchQuery, showExcluded, queryKey])
+
+  const load = () => {
+    fetchPage().catch(console.error).finally(() => { if (mounted.current) setLoading(false) })
+  }
+
+  useEffect(() => {
+    fetchPage()
+      .catch(console.error)
+      .finally(() => { if (mounted.current) setLoading(false) })
+  }, [fetchPage])
 
   // Poll the wanted list so background auto-grabs (and books leaving as they
   // import) show up without a manual reload (#1161). Mirrors QueuePage's 5s
@@ -69,7 +122,7 @@ export default function WantedPage() {
   // (#2360). It also pauses entirely while the tab is hidden.
   usePolling(() => {
     if (showResults !== null || grabbingGuid !== null || searchingId !== null) return
-    api.listWanted({ includeExcluded: showExcluded }).then(b => { if (mounted.current) setBooks(b) }).catch(() => {})
+    fetchPage().catch(() => {})
   }, 5000)
 
   useEffect(() => {
@@ -79,17 +132,6 @@ export default function WantedPage() {
   }, [toast])
 
   const showToast = useCallback((msg: string) => { setToast(msg) }, [])
-
-  const filtered = useMemo(() => {
-    if (!search.trim()) return books
-    // Folded on both sides, so this filter agrees with the server's search
-    // instead of being the stricter of the two. toLowerCase() alone folds case
-    // but not accents, so "cafe" never matched "Café" here (#1660).
-    return books.filter(b =>
-      foldedIncludes(b.title, search) ||
-      foldedIncludes(b.author?.authorName, search)
-    )
-  }, [books, search])
 
   const searchBook = async (book: Book) => {
     setSearchingId(book.id)
@@ -116,11 +158,14 @@ export default function WantedPage() {
   const unmonitor = async (book: Book) => {
     setUnmonitoringId(book.id)
     const prev = books
+    const prevTotal = total
     setBooks(books.filter(b => b.id !== book.id))
+    setTotal(Math.max(0, total - 1))
     try {
       await api.updateBook(book.id, { monitored: false })
     } catch {
       setBooks(prev)
+      setTotal(prevTotal)
       showToast("Couldn't update wanted list — reverted.")
     } finally {
       setUnmonitoringId(null)
@@ -130,7 +175,7 @@ export default function WantedPage() {
   const grab = async (result: SearchResult, book: Book) => {
     setGrabbingGuid(result.guid)
     try {
-      await api.grab({
+      const dl = await grabWithForceConfirm({
         guid: result.guid,
         title: result.title,
         nzbUrl: result.nzbUrl,
@@ -140,12 +185,13 @@ export default function WantedPage() {
         protocol: result.protocol,
         // The result's own media type wins over the book's 'both' (#2933).
         mediaType: result.mediaType || book.mediaType,
-      })
+      }, confirm, t)
+      if (!dl) return
       setGrabbedGuid(result.guid)
       setTimeout(() => {
         setShowResults(null)
         setGrabbedGuid(null)
-        api.listWanted().then(setBooks).catch(console.error)
+        load()
       }, 1200)
     } catch (err: unknown) {
       alert(err instanceof Error ? err.message : 'Grab failed')
@@ -154,16 +200,15 @@ export default function WantedPage() {
     }
   }
 
-  const { pageItems, paginationProps, reset } = usePagination(filtered, 50, 'wanted')
-
-  // This page's loaded ids, in order — handed to BookDetailPage as router
-  // state (#2548) for Previous/Next; see BookNavState there. Scoped to
-  // pageItems (this page's client-side-paginated slice), not the full
-  // filtered list — matches the "only as far as what's currently loaded"
-  // rule used by BooksPage/AuthorDetailPage.
+  // This page's loaded ids, in order, handed to BookDetailPage as router
+  // state (#2548) for Previous/Next; see BookNavState there. Scoped to this
+  // page, the slice the server returned, which matches the "only as far as
+  // what's currently loaded" rule used by BooksPage/AuthorDetailPage.
+  const pageItems = books
   const pageItemIds = pageItems.map(b => b.id)
 
-  useEffect(() => { reset() }, [search, reset])
+  // A selection only means something on the page it was made on.
+  useEffect(() => { setSelectedIds(new Set()) }, [list.page, list.values.q, showExcluded])
 
   // Keep the select-all checkbox indeterminate state in sync.
   const allPageSelected = pageItems.length > 0 && pageItems.every(b => selectedIds.has(b.id))
@@ -214,8 +259,9 @@ export default function WantedPage() {
 
   return (
     <div className={selectedIds.size > 0 ? 'pb-16' : ''}>
+      {confirmDialog}
       {toast && (
-        <div className="fixed bottom-6 right-6 z-50 px-4 py-2.5 bg-red-600 text-white rounded-lg shadow-lg text-sm font-medium animate-fade-in">
+        <div className="fixed bottom-safe-6 right-safe-6 z-50 px-4 py-2.5 bg-red-600 text-white rounded-lg shadow-lg text-sm font-medium animate-fade-in">
           {toast}
         </div>
       )}
@@ -224,7 +270,7 @@ export default function WantedPage() {
       <div className="flex items-center gap-3 mb-3">
         <h2 className="text-xl font-semibold text-slate-800 dark:text-zinc-200">{t('wanted.title')}</h2>
         <span className="text-xs text-slate-500 dark:text-zinc-500">
-          {t('wanted.countLabel', { filtered: filtered.length, total: books.length })}
+          {t('books.countLabel', { count: total, defaultValue: '{{count}} books' })}
         </span>
         <label className="ml-auto flex items-center gap-1.5 text-xs text-slate-600 dark:text-zinc-400 cursor-pointer select-none">
           <input
@@ -238,6 +284,7 @@ export default function WantedPage() {
       </div>
 
       <input
+        enterKeyHint="search"
         type="search"
         value={search}
         onChange={e => setSearch(e.target.value)}
@@ -247,12 +294,12 @@ export default function WantedPage() {
 
       {loading ? (
         <div className="text-slate-600 dark:text-zinc-500">{t('common.loading')}</div>
-      ) : books.length === 0 ? (
+      ) : total === 0 && !searchQuery ? (
         <div className="text-center py-16 text-slate-600 dark:text-zinc-500">
           <p>{t('wanted.empty')}</p>
           <ImportHints />
         </div>
-      ) : filtered.length === 0 ? (
+      ) : total === 0 ? (
         <div className="text-center py-16 text-slate-600 dark:text-zinc-500">
           <p>{t('wanted.noMatch')}</p>
         </div>
@@ -271,8 +318,8 @@ export default function WantedPage() {
             />
             <span aria-hidden />
             <span>{t('wanted.colTitleAuthor')}</span>
-            <span>{t('wanted.colFormat')}</span>
-            <span className="text-right">{t('wanted.colActions')}</span>
+            <span className="hidden sm:block">{t('wanted.colFormat')}</span>
+            <span className="hidden sm:block text-right">{t('wanted.colActions')}</span>
           </div>
 
           {pageItems.map((book, i) => {
@@ -297,20 +344,16 @@ export default function WantedPage() {
                   />
 
                   {/* uniform cover slot */}
-                  {book.imageUrl ? (
-                    <img
-                      src={book.imageUrl}
-                      alt=""
-                      className="w-8 h-11 object-cover rounded bg-slate-200 dark:bg-zinc-800"
-                    />
-                  ) : (
-                    <div
-                      className="w-8 h-11 rounded bg-slate-200 dark:bg-zinc-800 grid place-items-center text-[8px] text-slate-400 dark:text-zinc-600 text-center leading-tight"
-                      aria-hidden
-                    >
-                      {t('wanted.noCover')}
-                    </div>
-                  )}
+                  <CoverImage loading="lazy" decoding="async" src={book.imageUrl} alt="" className="w-8 h-11 object-cover rounded bg-slate-200 dark:bg-zinc-800"
+                    fallback={
+                      <div
+                        className="w-8 h-11 rounded bg-slate-200 dark:bg-zinc-800 grid place-items-center text-[8px] text-slate-400 dark:text-zinc-600 text-center leading-tight"
+                        aria-hidden
+                      >
+                        {t('wanted.noCover')}
+                      </div>
+                    }
+                  />
 
                   {/* title + author · year */}
                   <div className="min-w-0">
@@ -319,7 +362,7 @@ export default function WantedPage() {
                       // hopDepth: 1 — first hop into a book detail page from
                       // this list, not a further Previous/Next chain hop.
                       state={{ ids: pageItemIds, index: i, hopDepth: 1 }}
-                      className="block truncate text-sm font-medium text-slate-800 dark:text-zinc-200 hover:text-emerald-600 dark:hover:text-emerald-400 transition-colors"
+                      className="block [overflow-wrap:anywhere] sm:truncate text-sm font-medium text-slate-800 dark:text-zinc-200 hover:text-emerald-600 dark:hover:text-emerald-400 transition-colors"
                     >
                       {book.title}
                     </Link>
@@ -343,52 +386,54 @@ export default function WantedPage() {
                     )}
                   </div>
 
-                  {/* format control — compact select, still changes the value */}
-                  <div className="min-w-0">
-                    <select
-                      value={book.mediaType || 'ebook'}
-                      onChange={e => changeMediaType(book, e.target.value as 'ebook' | 'audiobook' | 'both')}
-                      className="w-full bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded text-[11px] px-1.5 py-0.5 focus:outline-none focus:border-slate-400 dark:focus:border-zinc-600"
-                      aria-label={t('wanted.changeFormat', { title: book.title })}
-                      title={t('wanted.changeFormat', { title: book.title })}
-                    >
-                      <option value="ebook">{t('books.mediaEbook')}</option>
-                      <option value="audiobook">{t('books.mediaAudiobook')}</option>
-                      <option value="both">{t('books.mediaBoth')}</option>
-                    </select>
-                    {book.mediaType === 'both' && (
-                      <div className="mt-0.5 text-[10px] text-slate-500 dark:text-zinc-500 truncate">
-                        {book.ebookFilePath ? t('wanted.ebookDone') : t('wanted.ebookNeeded')}
-                        {' · '}
-                        {book.audiobookFilePath ? t('wanted.audiobookDone') : t('wanted.audiobookNeeded')}
-                      </div>
-                    )}
-                  </div>
+                  <div className={ROW_CONTROLS} data-testid="wanted-row-controls">
+                    {/* format control: compact select, still changes the value */}
+                    <div className="min-w-28 flex-1 sm:min-w-0 sm:flex-none">
+                      <select
+                        value={book.mediaType || 'ebook'}
+                        onChange={e => changeMediaType(book, e.target.value as 'ebook' | 'audiobook' | 'both')}
+                        className="w-full bg-slate-200 dark:bg-zinc-800 border border-slate-300 dark:border-zinc-700 rounded text-[11px] px-1.5 py-0.5 focus:outline-none focus:border-slate-400 dark:focus:border-zinc-600"
+                        aria-label={t('wanted.changeFormat', { title: book.title })}
+                        title={t('wanted.changeFormat', { title: book.title })}
+                      >
+                        <option value="ebook">{t('books.mediaEbook')}</option>
+                        <option value="audiobook">{t('books.mediaAudiobook')}</option>
+                        <option value="both">{t('books.mediaBoth')}</option>
+                      </select>
+                      {book.mediaType === 'both' && (
+                        <div className="mt-0.5 text-[10px] text-slate-500 dark:text-zinc-500 truncate">
+                          {book.ebookFilePath ? t('wanted.ebookDone') : t('wanted.ebookNeeded')}
+                          {' · '}
+                          {book.audiobookFilePath ? t('wanted.audiobookDone') : t('wanted.audiobookNeeded')}
+                        </div>
+                      )}
+                    </div>
 
-                  {/* actions */}
-                  <div className="flex items-center justify-end gap-1.5">
-                    {book.excluded && (
-                      <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-500/20 text-amber-700 dark:text-amber-400">
-                        {t('wanted.excluded')}
-                      </span>
-                    )}
-                    <button
-                      type="button"
-                      onClick={() => unmonitor(book)}
-                      disabled={unmonitoringId === book.id}
-                      className="px-2 py-1 rounded text-xs font-medium bg-slate-200 dark:bg-zinc-800 hover:bg-amber-100 dark:hover:bg-amber-900/30 hover:text-amber-700 dark:hover:text-amber-400 text-slate-700 dark:text-zinc-300 disabled:opacity-50 transition-colors"
-                      title={t('wanted.unmonitorHint')}
-                    >
-                      {unmonitoringId === book.id ? '…' : t('common.unmonitor')}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => searchBook(book)}
-                      disabled={searchingId === book.id}
-                      className="px-2 py-1 rounded text-xs font-medium bg-emerald-600 hover:bg-emerald-500 text-white disabled:opacity-50 transition-colors"
-                    >
-                      {searchingId === book.id ? t('wanted.searching') : t('common.search')}
-                    </button>
+                    {/* actions */}
+                    <div className="flex items-center justify-end gap-1.5">
+                      {book.excluded && (
+                        <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-500/20 text-amber-700 dark:text-amber-400">
+                          {t('wanted.excluded')}
+                        </span>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => unmonitor(book)}
+                        disabled={unmonitoringId === book.id}
+                        className="px-2 py-1 rounded text-xs font-medium bg-slate-200 dark:bg-zinc-800 hover:bg-amber-100 dark:hover:bg-amber-900/30 hover:text-amber-700 dark:hover:text-amber-400 text-slate-700 dark:text-zinc-300 disabled:opacity-50 transition-colors"
+                        title={t('wanted.unmonitorHint')}
+                      >
+                        {unmonitoringId === book.id ? '…' : t('common.unmonitor')}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => searchBook(book)}
+                        disabled={searchingId === book.id}
+                        className="px-2 py-1 rounded text-xs font-medium bg-emerald-600 hover:bg-emerald-500 text-white disabled:opacity-50 transition-colors"
+                      >
+                        {searchingId === book.id ? t('wanted.searching') : t('common.search')}
+                      </button>
+                    </div>
                   </div>
                 </div>
 

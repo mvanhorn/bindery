@@ -6,13 +6,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/vavallee/bindery/internal/db"
 	"github.com/vavallee/bindery/internal/downloader"
 	"github.com/vavallee/bindery/internal/downloader/clienthost"
+	"github.com/vavallee/bindery/internal/downloader/nethint"
 	"github.com/vavallee/bindery/internal/httpsec"
 	"github.com/vavallee/bindery/internal/models"
 	"github.com/vavallee/bindery/internal/telemetry"
@@ -77,6 +81,9 @@ type DownloadClientHandler struct {
 	// goos and fsTimeout override runtime.GOOS and diagnoseFSTimeout in tests.
 	goos      string
 	fsTimeout time.Duration
+	// resetContentBreaker forgets the importer's paused blocklisting for a
+	// client (#3024). Nil (tests, unwired callers) does nothing.
+	resetContentBreaker func(clientID int64)
 }
 
 func NewDownloadClientHandler(clients *db.DownloadClientRepo) *DownloadClientHandler {
@@ -112,6 +119,35 @@ func (h *DownloadClientHandler) WithHealth(store *downloader.HealthStore) *Downl
 	return h
 }
 
+// WithContentBreakerReset wires the importer's breaker reset, called when a
+// client is edited, disabled or deleted: whatever paused automatic
+// blocklisting for it was presumably what the user just changed (#3024).
+func (h *DownloadClientHandler) WithContentBreakerReset(reset func(clientID int64)) *DownloadClientHandler {
+	h.resetContentBreaker = reset
+	return h
+}
+
+// forgetPausedBlocklisting resets the importer's breaker for a client and
+// clears the advisory it published.
+func (h *DownloadClientHandler) forgetPausedBlocklisting(clientID int64) {
+	if h.resetContentBreaker != nil {
+		h.resetContentBreaker(clientID)
+	}
+	if h.health != nil {
+		h.health.ClearAdvisory(clientID, downloader.AdvisoryBlocklist)
+	}
+}
+
+// forgetClient drops everything kept about a client that was disabled or
+// deleted: the importer's breaker, every advisory and the cached NZBGet
+// unpacker check.
+func (h *DownloadClientHandler) forgetClient(clientID int64) {
+	h.forgetPausedBlocklisting(clientID)
+	if h.health != nil {
+		h.health.ForgetClient(clientID)
+	}
+}
+
 func (h *DownloadClientHandler) WithStoragePaths(downloadDir, audiobookDownloadDir string) *DownloadClientHandler {
 	h.downloadDir = downloadDir
 	h.audiobookDownloadDir = audiobookDownloadDir
@@ -145,7 +181,11 @@ func (h *DownloadClientHandler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	client, err := h.clients.GetByID(r.Context(), id)
-	if err != nil || client == nil {
+	if err != nil {
+		writeServerError(w, r, err)
+		return
+	}
+	if client == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "download client not found"})
 		return
 	}
@@ -155,8 +195,7 @@ func (h *DownloadClientHandler) Get(w http.ResponseWriter, r *http.Request) {
 
 func (h *DownloadClientHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var c models.DownloadClient
-	if err := json.NewDecoder(r.Body).Decode(&c); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	if !decodeJSON(w, r, &c) {
 		return
 	}
 	if c.Name == "" || c.Host == "" {
@@ -196,14 +235,18 @@ func (h *DownloadClientHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	existing, err := h.clients.GetByID(r.Context(), id)
-	if err != nil || existing == nil {
+	if err != nil {
+		writeServerError(w, r, err)
+		return
+	}
+	if existing == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "download client not found"})
 		return
 	}
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		writeBodyReadError(w, err)
 		return
 	}
 
@@ -249,6 +292,7 @@ func (h *DownloadClientHandler) Update(w http.ResponseWriter, r *http.Request) {
 	// the remote service rejected a request, at which point the per-client
 	// re-Login path would burn an extra round-trip. (Wave 3 finding 10.)
 	downloader.Evict(id)
+	h.forgetPausedBlocklisting(id)
 	h.refreshClientHealthAsync(c)
 	h.attachClientHealth(&c)
 	writeJSON(w, http.StatusOK, downloadClientResponse(c))
@@ -369,7 +413,29 @@ func (h *DownloadClientHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	if h.health != nil {
 		h.health.Delete(id)
 	}
+	h.forgetClient(id)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// writeProbeError answers a download client connection test that failed. The
+// client was reached or it was not, and either way the fault is on the far
+// side, so it is a 502 rather than a 400 about the request. The operator still
+// needs to know what to fix, so the message is not generic:
+//
+//   - a network failure (refused, timed out, no such container) names the
+//     client and the host:port the operator configured, plus Bindery's own hint
+//     for the failure. The error text is not used, since it embeds the full
+//     request URL and is long enough to push the hint past the length cap;
+//   - anything else is what the client said, reduced by upstreamDetail to its
+//     first line, redacted and capped. A client's error page can hold anything.
+func writeProbeError(w http.ResponseWriter, r *http.Request, client *models.DownloadClient, err error) {
+	if hint := nethint.ForErr(err); hint != "" {
+		slog.Warn("download client test: unreachable", "method", r.Method, "path", r.URL.Path, "error", err)
+		msg := "could not reach " + downloader.ClientTypeName(client.Type) + " at " + net.JoinHostPort(client.Host, strconv.Itoa(client.Port)) + hint
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": msg})
+		return
+	}
+	writeUpstreamDetail(w, r, http.StatusBadGateway, err.Error(), err)
 }
 
 func (h *DownloadClientHandler) Test(w http.ResponseWriter, r *http.Request) {
@@ -378,7 +444,11 @@ func (h *DownloadClientHandler) Test(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	client, err := h.clients.GetByID(r.Context(), id)
-	if err != nil || client == nil {
+	if err != nil {
+		writeServerError(w, r, err)
+		return
+	}
+	if client == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "download client not found"})
 		return
 	}
@@ -396,7 +466,7 @@ func (h *DownloadClientHandler) Test(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := downloader.TestClient(r.Context(), client); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		writeProbeError(w, r, client, err)
 		return
 	}
 	health := h.refreshClientHealth(r.Context(), client)
@@ -429,8 +499,7 @@ func pathVisibilityForResponse(v downloader.PathVisibility) *downloader.PathVisi
 // The response shape mirrors Test (test-by-id) so the UI reuses one path.
 func (h *DownloadClientHandler) TestConfig(w http.ResponseWriter, r *http.Request) {
 	var c models.DownloadClient
-	if err := json.NewDecoder(r.Body).Decode(&c); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	if !decodeJSON(w, r, &c) {
 		return
 	}
 	if c.Host == "" {
@@ -452,7 +521,7 @@ func (h *DownloadClientHandler) TestConfig(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if err := downloader.TestClient(r.Context(), &c); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		writeProbeError(w, r, &c, err)
 		return
 	}
 	pathVis := downloader.CheckCompletedPathVisibility(r.Context(), &c, h.downloadDir, h.audiobookDownloadDir, h.downloadPathRemap)
@@ -513,6 +582,7 @@ func (h *DownloadClientHandler) refreshClientHealthAsync(client models.DownloadC
 	}
 	if !client.Enabled {
 		h.health.Delete(client.ID)
+		h.forgetClient(client.ID)
 		return
 	}
 	h.health.Set(client.ID, downloader.CheckingHealth())
@@ -523,6 +593,9 @@ func (h *DownloadClientHandler) refreshClientHealthAsync(client models.DownloadC
 		ctx, cancel := context.WithTimeout(h.bgCtx(), 15*time.Second)
 		defer cancel()
 		h.health.Set(client.ID, downloader.CheckDownloadClientHealth(ctx, &client, h.downloadDir, h.audiobookDownloadDir, h.downloadPathRemap))
+		// Create and edit are when an NZBGet's unpackers are worth asking
+		// about; the periodic probe never does (see NZBGetUnpackers).
+		h.health.NZBGetUnpackers(ctx, &client, true)
 	}()
 }
 
@@ -532,9 +605,13 @@ func (h *DownloadClientHandler) refreshClientHealth(ctx context.Context, client 
 	}
 	if !client.Enabled {
 		h.health.Delete(client.ID)
+		h.forgetClient(client.ID)
 		return nil
 	}
-	health := downloader.CheckDownloadClientHealth(ctx, client, h.downloadDir, h.audiobookDownloadDir, h.downloadPathRemap)
-	h.health.Set(client.ID, health)
-	return &health
+	h.health.Set(client.ID, downloader.CheckDownloadClientHealth(ctx, client, h.downloadDir, h.audiobookDownloadDir, h.downloadPathRemap))
+	h.health.NZBGetUnpackers(ctx, client, true)
+	// Return what the store now shows, not the raw probe: the store also
+	// carries the importer's paused blocklisting advisory (#3024), and the
+	// UI replaces the client's health with this answer.
+	return h.health.Get(client.ID)
 }

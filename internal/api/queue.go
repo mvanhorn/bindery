@@ -18,6 +18,7 @@ import (
 	"github.com/vavallee/bindery/internal/concurrency"
 	"github.com/vavallee/bindery/internal/db"
 	"github.com/vavallee/bindery/internal/downloader"
+	"github.com/vavallee/bindery/internal/downloader/nethint"
 	"github.com/vavallee/bindery/internal/indexer"
 	"github.com/vavallee/bindery/internal/indexer/newznab"
 	"github.com/vavallee/bindery/internal/models"
@@ -37,7 +38,120 @@ const queueClientPollConcurrency = 4
 
 var queueClientPollTimeout = 1 * time.Second
 
+// queueImportedVisibleFor is how long a finished import stays on the queue
+// page. Imported is the one state with nothing left to do, so the queue lists
+// an import for this long (a week covers "what arrived over the weekend") and
+// then leaves it to the History page. Every other state is listed however old
+// it is; see db.DownloadRepo.ListActive for why.
+const queueImportedVisibleFor = 7 * 24 * time.Hour
+
 var errAlreadyGrabbed = errors.New("already grabbed")
+
+// errNoDownloadClient marks a grab or retry that no enabled download client
+// can take. It is a setup problem the user can fix, so the handlers answer 400
+// with the actionable text and a code the web app keys on, never a 502.
+var errNoDownloadClient = errors.New("no enabled download client configured")
+
+// noClientError is the actionable "no enabled download client" message
+// (see noProtocolClientError). Its text names the protocol and the clients the
+// user does have, and it matches errNoDownloadClient through errors.Is.
+type noClientError struct{ msg string }
+
+func (e *noClientError) Error() string { return e.msg }
+func (e *noClientError) Unwrap() error { return errNoDownloadClient }
+
+// errSendFailed marks a release the download client refused or could not be
+// reached for. The text of the underlying failure comes from the client, so it
+// stays in the log, the download row and the history; the API answers with
+// sendFailedMessage.
+var errSendFailed = errors.New("failed to send to downloader")
+
+// sendFailedMessage is what a client is told when errSendFailed happens.
+const sendFailedMessage = "failed to send the release to the download client"
+
+// sendError carries the download client's own failure for the logs and the
+// download row. Error() keeps the full text; only errSendFailed is matched by
+// errors.Is, so callers branch on the kind without relaying the cause.
+type sendError struct{ cause error }
+
+func (e *sendError) Error() string   { return errSendFailed.Error() + ": " + e.cause.Error() }
+func (e *sendError) Unwrap() []error { return []error{errSendFailed, e.cause} }
+
+// sendFailedText is sendFailedMessage plus Bindery's own hint when the cause is
+// a network failure (refused, timed out, unknown container name). The hint is
+// fixed text chosen by the class of failure, so it names no host and no URL,
+// and it is what tells a user the client is down, not that the release is bad.
+func sendFailedText(err error) string {
+	return sendFailedMessage + nethint.ForErr(err)
+}
+
+// writeGrabError answers an error from grab or resendRelease. A missing client
+// is a setup problem the user can fix (400, with a code the web app keys on);
+// a refused or unreachable client is a generic 502, since the text comes from
+// the client; anything else is a storage fault and a generic 500.
+func writeGrabError(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case errors.Is(err, errNoDownloadClient):
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error(), "code": codeNoDownloadClient})
+	case errors.Is(err, errSendFailed):
+		slog.Warn("grab: download client did not take the release", "method", r.Method, "path", r.URL.Path, "error", err)
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": sendFailedText(err)})
+	default:
+		writeServerError(w, r, err)
+	}
+}
+
+// codeNoDownloadClient is the machine readable code on a "no download client"
+// 400, matched by isNoDownloadClientError in web/src/api/core.ts.
+const codeNoDownloadClient = "no_download_client"
+
+// queueItemMessage is the per row message of a bulk queue response, which the
+// page shows verbatim. It follows the single-item routes: the messages the
+// handlers already treat as safe (a conflict, a missing book, no client) pass
+// through, a send failure is generic, and a storage fault is logged and
+// replaced.
+func queueItemMessage(err error) string {
+	switch {
+	case errors.Is(err, errNoDownloadClient), errors.Is(err, errAlreadyGrabbed),
+		errors.Is(err, errRetryNotResendable), errors.Is(err, errGrabBookNotFound):
+		return err.Error()
+	case errors.Is(err, errSendFailed):
+		slog.Warn("bulk queue item: download client did not take the release", "error", err)
+		return sendFailedText(err)
+	default:
+		slog.Error("bulk queue item failed", "error", err)
+		return "internal server error"
+	}
+}
+
+// errRegrabForceable marks an "already grabbed" refusal the caller may
+// override by sending the grab again with force set (#2289). It is only ever
+// joined to errAlreadyGrabbed, never returned alone, and only for the caller's
+// own imported row: see forceRegrabbable.
+var errRegrabForceable = errors.New("grab it anyway to download it again")
+
+// forceRegrabbable reports whether a grab that sets force may reuse d even
+// though regrabbable refuses it (#2289).
+//
+// Only an imported row qualifies. Its download finished and its import ran,
+// so nothing is in flight that a re-grab could race or duplicate, and what
+// the refusal protects is the user fetching a book twice by accident. That is
+// the user's call to make, and before this the only ways to make it were to
+// delete the book or to delete the torrent in the download client, which on
+// a ratio tracked private tracker throws away the seeding history. The
+// reporter's release had been marked imported with no usable files, and
+// every Grab answered "already imported".
+//
+// Every other blocking state is live work (grabbed, downloading, completed,
+// importing) or work the scanner or an external tool still owns
+// (importFailed, importExternal, importHeld), and force does not open those.
+//
+// The row is reused in place, exactly as a dead row is. Nothing is removed
+// from the download client and no file is touched: the earlier import's
+// files stay with the book, and the history table keeps its record.
+func forceRegrabbable(d *models.Download) bool {
+	return d != nil && d.Status == models.StateImported
+}
 
 // foreignRowGrabbedDetail is the reason given when the release's download row
 // belongs to another user under tenancy. It says no more than that: the row's
@@ -317,10 +431,13 @@ func (h *QueueHandler) WithStoragePaths(downloadDir, audiobookDownloadDir string
 
 // WithDownloadPathRemap attaches the global BINDERY_DOWNLOAD_PATH_REMAP.
 //
-// Only "remove with data" on an rTorrent client reads it — rTorrent has no
-// delete-with-data command, so Bindery deletes the payload itself and has to
-// translate rTorrent's path the same way the importer does. Leaving it unset
-// simply falls back to the client's own PathRemap.
+// Two things read it. A manual grab runs the save path it sends to
+// qBittorrent or rTorrent through it when the client's own PathRemap does not
+// cover the download folder (#2665). "Remove with data" on an rTorrent client
+// uses it too: rTorrent has no delete-with-data command, so Bindery deletes
+// the payload itself and has to translate rTorrent's path the same way the
+// importer does. Leaving it unset simply falls back to the client's own
+// PathRemap.
 func (h *QueueHandler) WithDownloadPathRemap(remap string) *QueueHandler {
 	h.downloadPathRemap = remap
 	return h
@@ -370,14 +487,15 @@ func (h *QueueHandler) enrichedQueueItems(ctx context.Context) ([]enrichedQueueI
 		downloads []models.Download
 		err       error
 	)
+	importedSince := time.Now().Add(-queueImportedVisibleFor)
 	if auth.EnforceTenancy() && auth.UserRoleFromContext(ctx) != "admin" {
 		if uid := auth.UserIDFromContext(ctx); uid != 0 {
-			downloads, err = h.downloads.ListByUser(ctx, uid)
+			downloads, err = h.downloads.ListActiveByUser(ctx, uid, importedSince)
 		} else {
-			downloads, err = h.downloads.List(ctx)
+			downloads, err = h.downloads.ListActive(ctx, importedSince)
 		}
 	} else {
-		downloads, err = h.downloads.List(ctx)
+		downloads, err = h.downloads.ListActive(ctx, importedSince)
 	}
 	if err != nil {
 		return nil, nil, err
@@ -836,12 +954,14 @@ type grabRequest struct {
 	IndexerID *int64 `json:"indexerId"`
 	Protocol  string `json:"protocol"`
 	MediaType string `json:"mediaType"`
+	// Force re-grabs a release whose earlier download already imported,
+	// after the user confirmed it (#2289). See forceRegrabbable.
+	Force bool `json:"force"`
 }
 
 func (h *QueueHandler) Grab(w http.ResponseWriter, r *http.Request) {
 	var req grabRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.GUID == "" || req.NZBURL == "" {
@@ -871,7 +991,11 @@ func (h *QueueHandler) Grab(w http.ResponseWriter, r *http.Request) {
 	if errors.Is(err, errAlreadyGrabbed) {
 		// err carries alreadyGrabbedDetail's explanation; the search page shows
 		// this string verbatim, so send it rather than the bare sentinel (#1955).
-		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		// forceAvailable tells the UI it may offer to grab anyway (#2289).
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error":          err.Error(),
+			"forceAvailable": errors.Is(err, errRegrabForceable),
+		})
 		return
 	}
 	if errors.Is(err, errGrabBookNotFound) {
@@ -879,11 +1003,7 @@ func (h *QueueHandler) Grab(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		status := http.StatusBadGateway
-		if strings.Contains(err.Error(), "no enabled") && strings.Contains(err.Error(), "download client configured") {
-			status = http.StatusBadRequest
-		}
-		writeJSON(w, status, map[string]string{"error": err.Error()})
+		writeGrabError(w, r, err)
 		return
 	}
 
@@ -1067,11 +1187,7 @@ func (h *QueueHandler) RetryDownload(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 		return
 	case err != nil:
-		status := http.StatusBadGateway
-		if strings.Contains(err.Error(), "no enabled") && strings.Contains(err.Error(), "download client configured") {
-			status = http.StatusBadRequest
-		}
-		writeJSON(w, status, map[string]string{"error": err.Error()})
+		writeGrabError(w, r, err)
 		return
 	}
 
@@ -1164,7 +1280,7 @@ func (h *QueueHandler) BulkRetry(w http.ResponseWriter, r *http.Request) {
 			accepted, found, err := h.downloads.ResetImportRetry(ctx, id)
 			switch {
 			case err != nil:
-				setResult(id, queueRetryResult{Error: err.Error()})
+				setResult(id, queueRetryResult{Error: queueItemMessage(err)})
 			case !found:
 				setResult(id, queueRetryResult{Error: "download not found"})
 			case !accepted:
@@ -1176,7 +1292,7 @@ func (h *QueueHandler) BulkRetry(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if _, err := h.resendRelease(ctx, target); err != nil {
-			setResult(id, queueRetryResult{Error: err.Error()})
+			setResult(id, queueRetryResult{Error: queueItemMessage(err)})
 			return
 		}
 		setResult(id, queueRetryResult{OK: true, Action: retryActionResend})
@@ -1214,15 +1330,15 @@ func (h *QueueHandler) noProtocolClientError(ctx context.Context, protocol strin
 	otherEnabled, err := h.clients.GetEnabledByProtocol(ctx, other)
 	if err != nil {
 		// Don't mask the real failure with a guess about other clients.
-		return fmt.Errorf("no enabled %s download client configured", protocolLabel(protocol))
+		return &noClientError{msg: fmt.Sprintf("no enabled %s download client configured", protocolLabel(protocol))}
 	}
 	if len(otherEnabled) == 0 {
-		return fmt.Errorf("no enabled download client configured — add a download client")
+		return &noClientError{msg: "no enabled download client configured — add a download client"}
 	}
-	return fmt.Errorf(
+	return &noClientError{msg: fmt.Sprintf(
 		"no enabled %s download client configured — this release is %s but your only enabled client(s) are %s; add a %s client (%s)",
 		protocolLabel(protocol), protocol, other, other, protocolClientSuggestions(protocol),
-	)
+	)}
 }
 
 // otherProtocol returns the protocol opposite to the one given. Anything that
@@ -1295,8 +1411,19 @@ func (h *QueueHandler) grab(ctx context.Context, req grabRequest) (*models.Downl
 	if foreignRow && !foreignRowClaimable(existing, now) {
 		return nil, fmt.Errorf("%w: %s", errAlreadyGrabbed, foreignRowGrabbedDetail)
 	}
+	// forced is a grab the user confirmed over the "already imported"
+	// refusal (#2289). A foreign row is never forced: the check above already
+	// refuses every foreign imported row that still has its book, and force
+	// is for the caller's own rows whatever the order of these checks.
+	forced := false
 	if existing != nil && !regrabbable(existing) {
-		return nil, fmt.Errorf("%w: %s", errAlreadyGrabbed, alreadyGrabbedDetail(existing.Status))
+		if foreignRow || !forceRegrabbable(existing) {
+			return nil, fmt.Errorf("%w: %s", errAlreadyGrabbed, alreadyGrabbedDetail(existing.Status))
+		}
+		if !req.Force {
+			return nil, fmt.Errorf("%w: %s; %w", errAlreadyGrabbed, alreadyGrabbedDetail(existing.Status), errRegrabForceable)
+		}
+		forced = true
 	}
 
 	// Coerce zero-valued BookID/IndexerID to nil. A caller that JSON-decodes
@@ -1403,12 +1530,17 @@ func (h *QueueHandler) grab(ctx context.Context, req grabRequest) (*models.Downl
 	if existing != nil {
 		dl.ID = existing.ID
 		var ok bool
-		if foreignRow {
+		switch {
+		case foreignRow:
 			// The scheduler's claim, with its cooldown re-checked in SQL, so a
 			// row that changed hands or died again since the read above is a
 			// refusal rather than a takeover.
 			ok, err = h.downloads.RetryDeadForAutoGrab(ctx, dl, now.Add(-models.DeadRegrabCooldown))
-		} else {
+		case forced:
+			// Claims the row only while it is still imported, so a row that
+			// moved on since the read above is a refusal, not a takeover.
+			ok, err = h.downloads.RetryImported(ctx, dl)
+		default:
 			ok, err = h.downloads.RetryFailed(ctx, dl)
 		}
 		if err != nil {
@@ -1428,6 +1560,7 @@ func (h *QueueHandler) grab(ctx context.Context, req grabRequest) (*models.Downl
 		MediaType:            req.MediaType,
 		DownloadDir:          h.downloadDir,
 		AudiobookDownloadDir: h.audiobookDownloadDir,
+		GlobalRemap:          h.downloadPathRemap,
 	}.WithSeedLimits(h.resolveSeedLimits(ctx, indexerID)))
 	if err != nil {
 		slog.Error("failed to send download", "client_type", client.Type, "error", err, "title", req.Title)
@@ -1438,7 +1571,7 @@ func (h *QueueHandler) grab(ctx context.Context, req grabRequest) (*models.Downl
 		if h.notif != nil {
 			h.notif.Send(ctx, notifier.EventDownloadFailed, map[string]any{"title": req.Title, "message": err.Error()})
 		}
-		return nil, fmt.Errorf("failed to send to downloader: %w", err)
+		return nil, &sendError{cause: err}
 	}
 
 	if remoteID := sendRes.RemoteID; remoteID != "" {
@@ -1618,11 +1751,26 @@ func (o queueRemoveOptions) validate() error {
 // Everything other than the client call runs either way: the point of
 // RemoveFromClient=false is to forget the download, not to pretend it never
 // happened.
+//
+// The client call is skipped, deleteFiles included, while another download
+// row still uses the same torrent or job (downloader.ClientJobShared): a
+// torrent client adopts a torrent it already holds, so two grabs of one
+// release, by one user or two, can share it, and removing it for one row would
+// take it, and with deleteFiles its data, from the other. Only this row goes.
+//
+// The row is deleted BEFORE that check. A bulk remove runs items concurrently,
+// and two rows sharing a torrent would otherwise each see the other, both skip
+// the client, and leave the torrent behind with nothing tracking it. Deleting
+// first means whichever check runs last sees no other row and removes it.
 func (h *QueueHandler) removeQueueItem(ctx context.Context, target *models.Download, opts queueRemoveOptions) error {
+	if err := h.downloads.Delete(ctx, target.ID); err != nil {
+		return err
+	}
+
 	if opts.RemoveFromClient && target.DownloadClientID != nil {
 		client, err := h.clients.GetByID(ctx, *target.DownloadClientID)
 		if err == nil && client != nil {
-			if err := downloader.RemoveDownload(ctx, client, target, opts.DeleteFiles, h.downloadPathRemap); err != nil {
+			if _, err := downloader.RemoveDownloadUnlessShared(ctx, h.downloads, client, target, opts.DeleteFiles, h.downloadPathRemap, "queue remove"); err != nil {
 				slog.Warn("failed to remove download from client", "download_id", target.ID, "client_id", client.ID, "error", err)
 			}
 		} else if err != nil {
@@ -1646,7 +1794,7 @@ func (h *QueueHandler) removeQueueItem(ctx context.Context, target *models.Downl
 		}
 	}
 
-	return h.downloads.Delete(ctx, target.ID)
+	return nil
 }
 
 // bulkDeleteConcurrency bounds how many queue items a single bulk-remove fans
@@ -1721,7 +1869,7 @@ func (h *QueueHandler) BulkDelete(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := h.removeQueueItem(ctx, &target, opts); err != nil {
-			setResult(id, bulkItemResult{Error: err.Error()})
+			setResult(id, bulkItemResult{Error: queueItemMessage(err)})
 			return
 		}
 		setResult(id, bulkItemResult{OK: true})
